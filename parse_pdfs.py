@@ -3,14 +3,12 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from collections import defaultdict
 from pathlib import Path
+from statistics import median
 
 import fitz
 from sqlalchemy import text
-
-from statistics import median
-
-from collections import defaultdict
 
 from pipelines.db import engine
 
@@ -107,27 +105,26 @@ HEADING_RE = re.compile(
     r"|"
     r"(annexe|appendix|chapitre|chapter)\s+[A-Z0-9IVXLC]+(\s*[:\-]\s*.+)?"
     r"|"
-    r"[A-ZÉÈÀÙÂÊÎÔÛÇ][A-Za-zÉÈÀÙÂÊÎÔÛÇéèàùâêîôûç0-9'’()\-,:;/ ]{5,}"
+    r"[A-ZÉÈÀÙÂÊÎÔÛÇ0-9][A-ZÉÈÀÙÂÊÎÔÛÇ0-9'’()\-,:;/ ]{4,}"
     r")$"
 )
+NUMBERED_HEADING_RE = re.compile(r"^\d+(\.\d+)*\s+\S+")
+SECTION_KEYWORD_RE = re.compile(r"^(annexe|appendix|chapter|chapitre)\b", re.IGNORECASE)
 
 
-# Explicit reject patterns: These catch page numbers, isolated dates, dot-leader TOC lines, and very short furniture.
 PAGE_NUMBER_ONLY_RE = re.compile(
     r"^\s*(page\s+\d+(\s+of\s+\d+)?|\d+\s*/\s*\d+|\d+)\s*$",
-    re.IGNORECASE,)
-
-DOT_LEADER_RE = re.compile(
-    r"\.{2,}\s*\d+\s*$")
-
+    re.IGNORECASE,
+)
+DOT_LEADER_RE = re.compile(r"\.{2,}\s*\d+\s*$")
 MONTH_LINE_RE = re.compile(
     r"^(janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre|"
     r"january|february|march|april|may|june|july|august|september|october|november|december)"
     r"(\s+\d{4})?$",
-    re.IGNORECASE,)
+    re.IGNORECASE,
+)
+ALL_CAPS_BRANDISH_RE = re.compile(r"^[A-ZÉÈÀÙÂÊÎÔÛÇ]\s(?:[A-ZÉÈÀÙÂÊÎÔÛÇ]\s){2,}[A-ZÉÈÀÙÂÊÎÔÛÇ]$")
 
-ALL_CAPS_BRANDISH_RE = re.compile(
-    r"^[A-ZÉÈÀÙÂÊÎÔÛÇ]\s(?:[A-ZÉÈÀÙÂÊÎÔÛÇ]\s){2,}[A-ZÉÈÀÙÂÊÎÔÛÇ]$")
 
 def normalize_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
@@ -136,31 +133,62 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# More normalization helpers
+
 def clean_inline_text(text: str) -> str:
     text = normalize_text(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-# More normalization helpers
+
 def norm_for_repeat(text: str) -> str:
     t = clean_inline_text(text).lower()
     t = re.sub(r"\d+", "#", t)
     return t
 
+
 def detect_language(text: str, db_hint: str | None) -> str | None:
-    sample = text[:4000].lower()
-    fr_markers = [" résumé", " table des matières", " méthode", " références", " annexe "]
-    en_markers = [" summary", " table of contents", " methods", " references", " appendix "]
-    fr_score = sum(m in sample for m in fr_markers)
-    en_score = sum(m in sample for m in en_markers)
+    pages = text.split("\n\n<<<PAGE_BREAK>>>\n\n")
+    if not pages:
+        return db_hint
+
+    sample_pages = pages[:3] + (pages[-2:] if len(pages) > 3 else [])
+    sample = " ".join(sample_pages).lower()
+
+    fr_markers = [
+        " le ",
+        " la ",
+        " les ",
+        " des ",
+        " et ",
+        " pour ",
+        "résumé",
+        "table des matières",
+        "méthode",
+        "références",
+        "annexe",
+    ]
+    en_markers = [
+        " the ",
+        " and ",
+        " for ",
+        " with ",
+        " by ",
+        "summary",
+        "table of contents",
+        "methods",
+        "references",
+        "appendix",
+    ]
+
+    fr_score = sum(sample.count(m) for m in fr_markers)
+    en_score = sum(sample.count(m) for m in en_markers)
     if fr_score > en_score:
         return "fr"
     if en_score > fr_score:
         return "en"
     return db_hint
 
-#First pass: extract structured block candidates, not headings yet
+
 def extract_block_candidates(page_dict: dict, page_num: int, page_height: float) -> list[dict]:
     stats = page_font_stats(page_dict)
     body_median = stats["median"] or 0.0
@@ -187,26 +215,31 @@ def extract_block_candidates(page_dict: dict, page_num: int, page_height: float)
         y0 = float(bbox[1])
         y1 = float(bbox[3])
 
-        out.append({
-            "page_num": page_num,
-            "text": text,
-            "bbox": bbox,
-            "y0": y0,
-            "y1": y1,
-            "page_height": page_height,
-            "max_font_size": max(sizes),
-            "median_font_size": median(sizes),
-            "body_median_font_size": body_median,
-            "is_boldish": any((int(span.get("flags", 0)) & 16) or "bold" in str(span.get("font", "")).lower() for span in spans),
-            "line_count": len(lines),
-            "span_count": len(spans),
-        })
+        out.append(
+            {
+                "page_num": page_num,
+                "text": text,
+                "bbox": bbox,
+                "y0": y0,
+                "y1": y1,
+                "page_height": page_height,
+                "max_font_size": max(sizes),
+                "median_font_size": median(sizes),
+                "body_median_font_size": body_median,
+                "is_boldish": any(
+                    (int(span.get("flags", 0)) & 16) or "bold" in str(span.get("font", "")).lower() for span in spans
+                ),
+                "line_count": len(lines),
+                "span_count": len(spans),
+            }
+        )
     return out
 
-#Second pass: reject obvious non-headings
+
 def is_probable_heading(c: dict, repeated_texts: set[str], toc_pages: set[int]) -> bool:
     text = c["text"]
     tnorm = norm_for_repeat(text)
+    text_l = text.lower()
 
     if not text or len(text) < 4:
         return False
@@ -226,32 +259,24 @@ def is_probable_heading(c: dict, repeated_texts: set[str], toc_pages: set[int]) 
     if ALL_CAPS_BRANDISH_RE.match(text):
         return False
 
-    if c["page_num"] in toc_pages and (DOT_LEADER_RE.search(text) or re.search(r"\b\d+\s*$", text)):
-        return False
+    if c["page_num"] in toc_pages:
+        return text_l in {"table des matières", "table of contents"}
 
     top_margin = c["page_height"] * 0.08
     bottom_margin = c["page_height"] * 0.90
 
-    is_explicitly_numbered = bool(re.match(r"^\d+(\.\d+)*\s+\S+", text))
-    is_section_keyword = bool(re.match(r"^(annexe|appendix|chapter|chapitre)\b", text, re.IGNORECASE))
+    is_explicitly_numbered = bool(NUMBERED_HEADING_RE.match(text))
+    is_section_keyword = bool(SECTION_KEYWORD_RE.match(text))
 
     if c["y0"] > bottom_margin and not (is_explicitly_numbered or is_section_keyword):
         return False
 
-    if c["y1"] < top_margin:
+    if c["page_num"] > 1 and c["y1"] < top_margin:
         return False
 
-    rel_size = (
-        c["max_font_size"] / c["body_median_font_size"]
-        if c["body_median_font_size"] > 0 else 1.0
-    )
+    rel_size = c["max_font_size"] / c["body_median_font_size"] if c["body_median_font_size"] > 0 else 1.0
 
-    looks_like_heading_text = (
-        is_explicitly_numbered
-        or is_section_keyword
-        or bool(HEADING_RE.match(text))
-    )
-
+    looks_like_heading_text = is_explicitly_numbered or is_section_keyword or bool(HEADING_RE.match(text))
     strong_typography = rel_size >= 1.20 or (c["is_boldish"] and rel_size >= 1.08)
 
     if not looks_like_heading_text:
@@ -262,57 +287,38 @@ def is_probable_heading(c: dict, repeated_texts: set[str], toc_pages: set[int]) 
 
     return True
 
-def extract_heading_candidates(page_dict: dict, page_num: int) -> list[dict]:
-    out = []
-    for block in page_dict.get("blocks", []):
-        if block.get("type") != 0:
-            continue
-        lines = block.get("lines", [])
-        spans = [span for line in lines for span in line.get("spans", [])]
-        if not spans:
-            continue
-        text = " ".join(span.get("text", "").strip() for span in spans).strip()
-        if not text:
-            continue
-        max_size = max(float(span.get("size", 0)) for span in spans)
-        if HEADING_RE.match(text):
-            out.append({
-                "page_num": page_num,
-                "text": text,
-                "bbox": block.get("bbox"),
-                "max_font_size": max_size,
-            })
-    return out
 
 def sanitize_blocks(blocks: list[dict]) -> list[dict]:
     safe = []
     for block in blocks:
-        if block.get("type") != 0:  # keep only text blocks
+        if block.get("type") != 0:
             continue
 
-        safe_lines = []
-        for line in block.get("lines", []):
-            safe_spans = []
-            for span in line.get("spans", []):
-                safe_spans.append({
-                    "text": span.get("text", ""),
-                    "size": float(span.get("size", 0)),
-                    "font": span.get("font"),
-                    "flags": span.get("flags"),
-                    "bbox": span.get("bbox"),
-                })
-            safe_lines.append({
-                "bbox": line.get("bbox"),
-                "spans": safe_spans,
-            })
+        lines = block.get("lines", [])
+        spans = [span for line in lines for span in line.get("spans", [])]
+        if not spans:
+            continue
 
-        safe.append({
-            "type": 0,
-            "bbox": block.get("bbox"),
-            "lines": safe_lines,
-        })
+        text = clean_inline_text(" ".join(span.get("text", "") for span in spans))
+        if not text:
+            continue
+
+        sizes = [float(span.get("size", 0) or 0) for span in spans if float(span.get("size", 0) or 0) > 0]
+        max_font_size = max(sizes) if sizes else 0.0
+        is_boldish = any((int(span.get("flags", 0)) & 16) or "bold" in str(span.get("font", "")).lower() for span in spans)
+
+        safe.append(
+            {
+                "text": text,
+                "bbox": block.get("bbox"),
+                "max_font_size": max_font_size,
+                "is_boldish": is_boldish,
+            }
+        )
     return safe
 
+
+# Mention counts only, not true table/figure/reference object extraction counts.
 def count_markers(text: str) -> tuple[int, int, int]:
     t = text.lower()
     refs = t.count("références") + t.count("references")
@@ -320,7 +326,7 @@ def count_markers(text: str) -> tuple[int, int, int]:
     figures = t.count("figure ")
     return refs, tables, figures
 
-#Compute page-level font statistics. A heading should usually be large relative to the page’s ordinary text
+
 def page_font_stats(page_dict: dict) -> dict:
     sizes = []
     for block in page_dict.get("blocks", []):
@@ -336,7 +342,6 @@ def page_font_stats(page_dict: dict) -> dict:
     return {"median": median(sizes), "max": max(sizes)}
 
 
-# Detect repeated header/footer text across pages to kill running heads, repeated footers, report titles, institutional signatures, and page furniture.
 def repeated_page_furniture(candidates: list[dict], total_pages: int) -> set[str]:
     page_sets = defaultdict(set)
 
@@ -351,7 +356,7 @@ def repeated_page_furniture(candidates: list[dict], total_pages: int) -> set[str
         page_sets[key].add(c["page_num"])
 
     repeated = set()
-    threshold = max(3, int(total_pages * 0.2))
+    threshold = 2 if total_pages <= 5 else max(3, int(total_pages * 0.2))
 
     for (text_norm, zone), pages in page_sets.items():
         if zone in {"top", "bottom"} and len(pages) >= threshold:
@@ -359,14 +364,39 @@ def repeated_page_furniture(candidates: list[dict], total_pages: int) -> set[str
 
     return repeated
 
+
+def extract_title_from_first_page(pages: list[dict]) -> str | None:
+    if not pages:
+        return None
+
+    first_page = pages[0]
+    blocks = sorted(
+        [b for b in first_page.get("blocks", []) if b.get("text")],
+        key=lambda b: (b.get("bbox") or [0, 0, 0, 0])[1],
+    )
+    if not blocks:
+        return None
+
+    page_height = first_page.get("height") or 0
+    top_cutoff = page_height * 0.35 if page_height else None
+    top_blocks = [b for b in blocks if top_cutoff is None or (b.get("bbox") and b["bbox"][1] <= top_cutoff)]
+    candidates = top_blocks or blocks[:6]
+    if not candidates:
+        return None
+
+    best = max(candidates, key=lambda b: (b.get("max_font_size") or 0, -((b.get("bbox") or [0, 0, 0, 0])[1])))
+    title = clean_inline_text(best.get("text", ""))
+    return title[:500] if title else None
+
+
 def parse_pdf(path: Path, db_title: str | None, db_lang: str | None, file_hash: str | None) -> dict:
     with fitz.open(path) as doc:
         pages = []
         full_parts = []
         heading_candidates = []
-        total_refs = 0
-        total_tables = 0
-        total_figures = 0
+        total_refs_mentions = 0
+        total_tables_mentions = 0
+        total_figures_mentions = 0
         toc_pages = []
         all_block_candidates = []
 
@@ -383,9 +413,9 @@ def parse_pdf(path: Path, db_title: str | None, db_lang: str | None, file_hash: 
             cursor += len("\n\n<<<PAGE_BREAK>>>\n\n")
 
             refs, tables, figures = count_markers(normalized)
-            total_refs += refs
-            total_tables += tables
-            total_figures += figures
+            total_refs_mentions += refs
+            total_tables_mentions += tables
+            total_figures_mentions += figures
 
             if "table des matières" in normalized.lower() or "table of contents" in normalized.lower():
                 toc_pages.append(i)
@@ -393,36 +423,36 @@ def parse_pdf(path: Path, db_title: str | None, db_lang: str | None, file_hash: 
             block_candidates = extract_block_candidates(page_dict, i, page.rect.height)
             all_block_candidates.extend(block_candidates)
 
-            pages.append({
-                "page_num": i,
-                "width": page.rect.width,
-                "height": page.rect.height,
-                "char_start": char_start,
-                "char_end": char_end,
-                "raw_text": raw_text,
-                "normalized_text": normalized,
-                "blocks": sanitize_blocks(page_dict.get("blocks", [])),
-                "images_present": bool(page.get_images(full=True)),
-                "heading_candidates": [], # fill later
-            })
+            pages.append(
+                {
+                    "page_num": i,
+                    "width": page.rect.width,
+                    "height": page.rect.height,
+                    "char_start": char_start,
+                    "char_end": char_end,
+                    "raw_text": raw_text,
+                    "normalized_text": normalized,
+                    "blocks": sanitize_blocks(page_dict.get("blocks", [])),
+                    "images_present": bool(page.get_images(full=True)),
+                    "heading_candidates": [],
+                }
+            )
 
-            repeated_texts = repeated_page_furniture(all_block_candidates, len(doc))
-            toc_page_set = set(toc_pages)
-            
-            heading_candidates = [
-                c for c in all_block_candidates
-            if is_probable_heading(c, repeated_texts, toc_page_set)
-            ]
+        repeated_texts = repeated_page_furniture(all_block_candidates, len(doc))
+        toc_page_set = set(toc_pages)
+        heading_candidates = [c for c in all_block_candidates if is_probable_heading(c, repeated_texts, toc_page_set)]
 
         full_text = "\n\n<<<PAGE_BREAK>>>\n\n".join(full_parts)
         detected_language = detect_language(full_text, db_lang)
 
-        by_page = {}
+        by_page: dict[int, list[dict]] = {}
         for c in heading_candidates:
             by_page.setdefault(c["page_num"], []).append(c)
-            
+
         for p in pages:
             p["heading_candidates"] = by_page.get(p["page_num"], [])
+
+        detected_title = extract_title_from_first_page(pages) or db_title or path.stem
 
         return {
             "product_id": None,
@@ -438,7 +468,7 @@ def parse_pdf(path: Path, db_title: str | None, db_lang: str | None, file_hash: 
             },
             "document": {
                 "page_count": len(doc),
-                "title_hint": db_title or path.stem,
+                "title_hint": detected_title,
                 "language_hint": db_lang,
                 "detected_language": detected_language,
             },
@@ -453,15 +483,16 @@ def parse_pdf(path: Path, db_title: str | None, db_lang: str | None, file_hash: 
                 "warnings": [],
             },
             "metadata_summary": {
-                "detected_title": db_title or path.stem,
+                "detected_title": detected_title,
                 "detected_language": detected_language,
                 "detected_sections_json": json.dumps(heading_candidates, ensure_ascii=False),
-                "detected_references_count": total_refs,
-                "detected_tables_count": total_tables,
-                "detected_figures_count": total_figures,
+                "detected_references_count": total_refs_mentions,
+                "detected_tables_count": total_tables_mentions,
+                "detected_figures_count": total_figures_mentions,
                 "ocr_used": False,
             },
         }
+
 
 def main() -> None:
     with engine.begin() as conn:
@@ -472,6 +503,9 @@ def main() -> None:
         path = Path(row["local_path"])
 
         try:
+            with engine.begin() as conn:
+                conn.execute(MARK_STARTED_SQL, {"product_id": product_id})
+
             payload = parse_pdf(
                 path=path,
                 db_title=row["product_title"],
@@ -487,6 +521,7 @@ def main() -> None:
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            tmp_path.replace(out_path)
 
             with engine.begin() as conn:
                 conn.execute(
@@ -500,11 +535,15 @@ def main() -> None:
                 )
                 conn.execute(MARK_SUCCESS_SQL, {"product_id": product_id})
 
-            tmp_path.replace(out_path)
-
         except Exception as e:
+            error_text = f"{type(e).__name__}: {e}"
+            print(f"ERROR parsing {product_id}: {error_text}")
             with engine.begin() as conn:
-                conn.execute(MARK_FAILED_SQL, {"product_id": product_id, "parse_error_text": f"{type(e).__name__}: {e}",},)
+                conn.execute(
+                    MARK_FAILED_SQL,
+                    {"product_id": product_id, "parse_error_text": error_text},
+                )
+
 
 if __name__ == "__main__":
     main()
