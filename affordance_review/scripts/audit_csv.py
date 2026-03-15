@@ -1,19 +1,50 @@
 #!/usr/bin/env python3
 """
-Audit a Scopus CSV export and write:
+Audit a Scopus CSV export before DB ingestion and write:
+
 - outputs/logs/csv_audit.txt
 - outputs/tables/missingness.csv
 - outputs/tables/duplicate_docs.csv
+- outputs/tables/reference_field_audit.csv
+- outputs/tables/reference_field_problem_docs.csv
 
-Checks:
-- robust CSV loading with encoding fallback
+Purpose
+-------
+This is the input-layer audit for the pipeline:
+
+    audit_csv.py -> init_db.py -> build_db.py
+
+It should answer questions that matter *before* ingestion/parsing:
+
+- Is the CSV structurally readable?
+- Are key columns present?
+- Are document identifiers unique?
+- How complete are high-value fields?
+- Is the References field present and usable?
+- Are there obvious bibliography-shape problems already in the CSV?
+- Which documents are likely to generate segmentation/parsing failures later?
+
+This script does not parse references. It audits the source CSV so that
+problems can be fixed before init_db.py and build_db.py.
+
+Checks
+------
+- robust CSV loading with encoding + delimiter fallback
 - null / blank rates per column
 - duplicate EID
 - duplicate DOI
-- count missing abstracts
-- count missing references
-- semicolon-separated field consistency
-- summary counts for DOI / Abstract / Author Keywords / References
+- missing Abstract / References counts
+- semicolon-separated field consistency for Scopus-style columns
+- document-level coverage summaries
+- bibliography-shape diagnostics on the References field:
+    - missing / blank references
+    - short reference strings
+    - no year-like pattern
+    - semicolon-heavy references
+    - DOI / URL presence
+    - line-break contamination
+    - suspiciously long references
+- per-document extraction-risk summary for later inspection
 """
 
 from __future__ import annotations
@@ -31,8 +62,9 @@ INPUT_CSV = Path("data/raw/scopus_affordance_2010_2026.csv")
 OUTPUT_LOG = Path("outputs/logs/csv_audit.txt")
 OUTPUT_MISSINGNESS = Path("outputs/tables/missingness.csv")
 OUTPUT_DUPLICATES = Path("outputs/tables/duplicate_docs.csv")
+OUTPUT_REFERENCE_AUDIT = Path("outputs/tables/reference_field_audit.csv")
+OUTPUT_REFERENCE_PROBLEM_DOCS = Path("outputs/tables/reference_field_problem_docs.csv")
 
-# High-value fields to surface in reports when available
 KEY_FIELDS = [
     "Authors",
     "Author full names",
@@ -49,7 +81,6 @@ KEY_FIELDS = [
     "EID",
 ]
 
-# Semicolon-delimited fields typically found in Scopus exports
 SEMICOLON_FIELDS = [
     "Authors",
     "Author full names",
@@ -59,43 +90,50 @@ SEMICOLON_FIELDS = [
     "References",
 ]
 
-# Fields where aligned counts matter across columns
-# Example: Authors / Author full names / Author(s) ID should usually have matching item counts
 ALIGNED_GROUPS = [
     ["Authors", "Author full names", "Author(s) ID"],
 ]
 
 REQUIRED_COLUMNS = ["EID"]
 
+YEAR_RE = re.compile(r"(?<!\d)(?:18\d{2}|19\d{2}|20\d{2})(?!\d)")
+DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", re.I)
+URL_RE = re.compile(r"https?://\S+", re.I)
+
 
 def ensure_output_dirs() -> None:
     OUTPUT_LOG.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_MISSINGNESS.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_DUPLICATES.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_REFERENCE_AUDIT.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_REFERENCE_PROBLEM_DOCS.parent.mkdir(parents=True, exist_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Audit a Scopus CSV export.")
+    parser = argparse.ArgumentParser(description="Audit a Scopus CSV export before DB ingestion.")
     parser.add_argument("--input", type=Path, default=INPUT_CSV, help="Input CSV path")
     parser.add_argument("--output-log", type=Path, default=OUTPUT_LOG, help="Output audit report path")
     parser.add_argument("--output-missingness", type=Path, default=OUTPUT_MISSINGNESS, help="Output missingness CSV path")
     parser.add_argument("--output-duplicates", type=Path, default=OUTPUT_DUPLICATES, help="Output duplicates CSV path")
+    parser.add_argument(
+        "--output-reference-audit",
+        type=Path,
+        default=OUTPUT_REFERENCE_AUDIT,
+        help="Output reference-field audit CSV path",
+    )
+    parser.add_argument(
+        "--output-reference-problem-docs",
+        type=Path,
+        default=OUTPUT_REFERENCE_PROBLEM_DOCS,
+        help="Output per-document reference-risk CSV path",
+    )
     return parser.parse_args()
 
 
 def load_csv_robust(path: Path) -> tuple[pd.DataFrame, str, str]:
-    """
-    Load CSV with a small set of common encoding fallbacks.
-    """
-    encodings_to_try = [
-        "utf-8",
-        "utf-8-sig",
-        "cp1252",
-        "latin1",
-    ]
-
-    last_error: Optional[Exception] = None
+    encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
     separators = [",", ";", "\t"]
+    last_error: Optional[Exception] = None
 
     for enc in encodings_to_try:
         for sep in separators:
@@ -113,28 +151,18 @@ def load_csv_robust(path: Path) -> tuple[pd.DataFrame, str, str]:
 
 
 def normalize_blank_strings(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert empty or whitespace-only strings to NA for object columns.
-    """
     df = df.copy()
-    obj_cols = df.select_dtypes(include=["object"]).columns
+    obj_cols = df.select_dtypes(include=["object", "string"]).columns
     for col in obj_cols:
         df[col] = df[col].replace(r"^\s*$", pd.NA, regex=True)
     return df
 
 
 def has_content(series: pd.Series) -> pd.Series:
-    """
-    True if value is non-null and not just whitespace.
-    """
     return series.fillna("").astype(str).str.strip().ne("")
 
 
 def split_semicolon_items(value) -> list[str]:
-    """
-    Split a semicolon-delimited field into cleaned items.
-    Empty items are dropped.
-    """
     if pd.isna(value):
         return []
     text = str(value).strip()
@@ -145,16 +173,10 @@ def split_semicolon_items(value) -> list[str]:
 
 
 def item_count(series: pd.Series) -> pd.Series:
-    """
-    Number of semicolon-delimited items per row.
-    """
     return series.apply(lambda x: len(split_semicolon_items(x)))
 
 
 def inspect_semicolon_field(series: pd.Series) -> dict:
-    """
-    Produce simple consistency diagnostics for a semicolon-separated field.
-    """
     nonmissing = series[has_content(series)]
     if nonmissing.empty:
         return {
@@ -180,10 +202,6 @@ def inspect_semicolon_field(series: pd.Series) -> dict:
 
 
 def aligned_group_mismatches(df: pd.DataFrame, fields: Iterable[str]) -> dict:
-    """
-    For rows where at least one field in the group has content, compare semicolon-item counts.
-    Returns mismatch diagnostics.
-    """
     fields = [f for f in fields if f in df.columns]
     if len(fields) < 2:
         return {"checked_fields": fields, "rows_checked": 0, "rows_mismatch": 0}
@@ -216,10 +234,6 @@ def compute_missingness(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def duplicate_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build a table of duplicates for EID and DOI.
-    Includes useful identifying fields when present.
-    """
     frames = []
 
     if "EID" in df.columns:
@@ -260,14 +274,145 @@ def is_probable_duplicate_header(column_name: str) -> bool:
     return bool(re.search(r"\.\d+$", str(column_name)))
 
 
+def audit_reference_field(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Document-level audit of the Scopus References field before DB ingestion.
+
+    This does not parse references. It only characterizes whether the field
+    already looks risky for later segmentation / parsing.
+    """
+    if "References" not in df.columns:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(index=df.index)
+    ref_text = df["References"].fillna("").astype(str)
+    ref_text_stripped = ref_text.str.strip()
+
+    out["has_references"] = ref_text_stripped.ne("")
+    out["reference_char_len"] = ref_text_stripped.str.len()
+
+    out["reference_has_year"] = ref_text_stripped.str.contains(YEAR_RE.pattern, na=False, regex=True)
+    out["reference_has_doi"] = ref_text_stripped.str.contains(DOI_RE, na=False)
+    out["reference_has_url"] = ref_text_stripped.str.contains(URL_RE, na=False)
+
+    out["reference_semicolon_count"] = ref_text_stripped.str.count(";")
+    out["reference_comma_count"] = ref_text_stripped.str.count(",")
+    out["reference_newline_count"] = ref_text.str.count(r"\n|\r")
+    out["reference_pipe_count"] = ref_text_stripped.str.count(r"\|")
+
+    out["reference_short"] = out["has_references"] & (out["reference_char_len"] < 80)
+    out["reference_very_short"] = out["has_references"] & (out["reference_char_len"] < 40)
+    out["reference_very_long"] = out["reference_char_len"] >= 30000
+
+    out["reference_no_year"] = out["has_references"] & ~out["reference_has_year"]
+    out["reference_semicolon_heavy"] = out["reference_semicolon_count"] >= 300
+    out["reference_newline_heavy"] = out["reference_newline_count"] >= 5
+    out["reference_sparse_punctuation"] = (
+        out["has_references"]
+        & (out["reference_char_len"] >= 120)
+        & (out["reference_comma_count"] <= 1)
+        & (out["reference_semicolon_count"] <= 1)
+    )
+
+    out["reference_has_double_semicolon"] = ref_text_stripped.str.contains(r";\s*;", na=False)
+    out["reference_has_trailing_semicolon"] = ref_text_stripped.str.contains(r";\s*$", na=False)
+    out["reference_low_semicolon_density"] = (
+        out["has_references"]
+        & (out["reference_char_len"] >= 2000)
+        & (out["reference_semicolon_count"] <= 3)
+    )
+    out["reference_extreme_newline_contamination"] = out["reference_newline_count"] >= 20
+
+    out["reference_risk_score"] = (
+        out["reference_very_short"].astype(int) * 4
+        + out["reference_no_year"].astype(int) * 4
+        + out["reference_has_double_semicolon"].astype(int) * 2
+        + out["reference_has_trailing_semicolon"].astype(int) * 1
+        + out["reference_low_semicolon_density"].astype(int) * 3
+        + out["reference_extreme_newline_contamination"].astype(int) * 2
+    )
+
+    preferred_id = None
+    for candidate in ["EID", "DOI", "Title"]:
+        if candidate in df.columns:
+            preferred_id = candidate
+            break
+
+    if preferred_id:
+        out.insert(0, preferred_id, df[preferred_id])
+
+    if "Title" in df.columns and "Title" not in out.columns:
+        out.insert(1 if preferred_id else 0, "Title", df["Title"])
+
+    if "Year" in df.columns:
+        out["Year"] = df["Year"]
+
+    if "Source title" in df.columns:
+        out["Source title"] = df["Source title"]
+
+    return out.reset_index(drop=True)
+
+
+def summarize_reference_problem_docs(df: pd.DataFrame, ref_audit: pd.DataFrame) -> pd.DataFrame:
+    """
+    Produce a compact per-document audit table highlighting rows likely to cause
+    later segmentation/parsing trouble.
+    """
+    if ref_audit.empty:
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+
+    if "EID" in df.columns:
+        out["EID"] = df["EID"]
+    if "Title" in df.columns:
+        out["Title"] = df["Title"]
+    if "Year" in df.columns:
+        out["Year"] = df["Year"]
+    if "Source title" in df.columns:
+        out["Source title"] = df["Source title"]
+
+    out["has_references"] = ref_audit["has_references"]
+    out["reference_char_len"] = ref_audit["reference_char_len"]
+    out["reference_no_year"] = ref_audit["reference_no_year"]
+    out["reference_semicolon_heavy"] = ref_audit["reference_semicolon_heavy"]
+    out["reference_newline_heavy"] = ref_audit["reference_newline_heavy"]
+    out["reference_sparse_punctuation"] = ref_audit["reference_sparse_punctuation"]
+    out["reference_very_short"] = ref_audit["reference_very_short"]
+    out["reference_very_long"] = ref_audit["reference_very_long"]
+    out["reference_risk_score"] = ref_audit["reference_risk_score"]
+
+    problem_mask = (
+        ~out["has_references"]
+        | out["reference_no_year"]
+        | out["reference_semicolon_heavy"]
+        | out["reference_newline_heavy"]
+        | out["reference_sparse_punctuation"]
+        | out["reference_very_short"]
+        | out["reference_very_long"]
+    )
+
+    out = out.loc[problem_mask].copy()
+    out = out.sort_values(
+        ["reference_risk_score", "reference_char_len"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+    return out
+
+
 def main() -> int:
     args = parse_args()
 
     global INPUT_CSV, OUTPUT_LOG, OUTPUT_MISSINGNESS, OUTPUT_DUPLICATES
+    global OUTPUT_REFERENCE_AUDIT, OUTPUT_REFERENCE_PROBLEM_DOCS
+
     INPUT_CSV = args.input
     OUTPUT_LOG = args.output_log
     OUTPUT_MISSINGNESS = args.output_missingness
     OUTPUT_DUPLICATES = args.output_duplicates
+    OUTPUT_REFERENCE_AUDIT = args.output_reference_audit
+    OUTPUT_REFERENCE_PROBLEM_DOCS = args.output_reference_problem_docs
 
     ensure_output_dirs()
 
@@ -288,7 +433,12 @@ def main() -> int:
     duplicates = duplicate_rows(df)
     duplicates.to_csv(OUTPUT_DUPLICATES, index=False)
 
-    # Required counts
+    ref_audit = audit_reference_field(df)
+    ref_audit.to_csv(OUTPUT_REFERENCE_AUDIT, index=False)
+
+    problem_docs = summarize_reference_problem_docs(df, ref_audit)
+    problem_docs.to_csv(OUTPUT_REFERENCE_PROBLEM_DOCS, index=False)
+
     missing_abstracts = int(df["Abstract"].isna().sum()) if "Abstract" in df.columns else None
     missing_references = int(df["References"].isna().sum()) if "References" in df.columns else None
 
@@ -308,7 +458,6 @@ def main() -> int:
         doi_norm = df["DOI"].fillna("").astype(str).str.strip().str.lower()
         duplicate_doi_count = int((doi_norm.ne("") & doi_norm.duplicated(keep=False)).sum())
 
-    # Semicolon field diagnostics
     semicolon_report = {}
     for col in SEMICOLON_FIELDS:
         if col in df.columns:
@@ -316,10 +465,8 @@ def main() -> int:
 
     aligned_report = []
     for group in ALIGNED_GROUPS:
-        result = aligned_group_mismatches(df, group)
-        aligned_report.append(result)
+        aligned_report.append(aligned_group_mismatches(df, group))
 
-    # Assertions / hard checks
     hard_check_messages = []
     if missing_required_columns:
         hard_check_messages.append(f"FAIL: Missing required columns: {missing_required_columns}.")
@@ -334,7 +481,6 @@ def main() -> int:
             f"WARN: Potential duplicate-header columns detected: {duplicate_header_cols}."
         )
 
-    # Build text report
     lines = []
     lines.append("SCOPUS CSV AUDIT REPORT")
     lines.append("=" * 80)
@@ -343,6 +489,8 @@ def main() -> int:
     lines.append(f"Delimiter used: {separator_used!r}")
     lines.append(f"Rows: {n_rows:,}")
     lines.append(f"Columns: {n_cols:,}")
+    lines.append("")
+    lines.append("Pipeline stage: input-layer audit (run before init_db.py)")
     lines.append("")
 
     lines.append("HIGH-VALUE FIELD PRESENCE")
@@ -377,8 +525,7 @@ def main() -> int:
         lines.append(f"Missing References: {missing_references:,}")
     lines.append("")
     lines.append("Top 10 columns by missingness:")
-    top10 = missingness.head(10)
-    for _, row in top10.iterrows():
+    for _, row in missingness.head(10).iterrows():
         lines.append(
             f"- {row['column']}: {int(row['n_missing']):,} missing "
             f"({float(row['pct_missing']):.3f}%)"
@@ -416,23 +563,57 @@ def main() -> int:
         lines.append(f"  rows_mismatch: {result['rows_mismatch']:,}")
     lines.append("")
 
+    lines.append("REFERENCES FIELD AUDIT")
+    lines.append("-" * 80)
+    if ref_audit.empty:
+        lines.append("References column not found; no input-layer bibliography audit possible.")
+    else:
+        rows_with_references = int(ref_audit["has_references"].sum())
+        lines.append(f"Rows with nonblank References: {rows_with_references:,} / {n_rows:,}")
+        lines.append(f"Rows with blank References: {(~ref_audit['has_references']).sum():,}")
+        lines.append(f"Rows with References but no year-like pattern: {int(ref_audit['reference_no_year'].sum()):,}")
+        lines.append(f"Rows with very short References (<40 chars): {int(ref_audit['reference_very_short'].sum()):,}")
+        lines.append(f"Rows with short References (<80 chars): {int(ref_audit['reference_short'].sum()):,}")
+        lines.append(f"Rows with semicolon-heavy References (>=20 semicolons): {int(ref_audit['reference_semicolon_heavy'].sum()):,}")
+        lines.append(f"Rows with newline-heavy References (>=5 line breaks): {int(ref_audit['reference_newline_heavy'].sum()):,}")
+        lines.append(f"Rows with sparse-punctuation References: {int(ref_audit['reference_sparse_punctuation'].sum()):,}")
+        lines.append(f"Rows with very long References (>=5000 chars): {int(ref_audit['reference_very_long'].sum()):,}")
+        lines.append(f"Rows with DOI-like pattern in References: {int(ref_audit['reference_has_doi'].sum()):,}")
+        lines.append(f"Rows with URL-like pattern in References: {int(ref_audit['reference_has_url'].sum()):,}")
+        lines.append("")
+        lines.append("Top 20 documents most likely to create later segmentation/parsing trouble:")
+        preview_cols = [c for c in ["EID", "Title", "Year", "Source title", "reference_risk_score", "reference_char_len"] if c in problem_docs.columns]
+        for _, row in problem_docs.head(20)[preview_cols].iterrows():
+            bits = [f"{col}={row[col]!r}" for col in preview_cols]
+            lines.append("- " + " | ".join(bits))
+    lines.append("")
+
+    lines.append("NEXT PIPELINE ACTION")
+    lines.append("-" * 80)
+    lines.append("1. If References field problems are high here, fix source/export issues before init_db.py.")
+    lines.append("2. If this layer looks acceptable, run init_db.py and audit preserved raw_references.")
+    lines.append("3. Only then run build_db.py and interpret parse_quality / clustering results.")
+    lines.append("")
+
     lines.append("OUTPUT FILES")
     lines.append("-" * 80)
     lines.append(f"- {OUTPUT_LOG}")
     lines.append(f"- {OUTPUT_MISSINGNESS}")
     lines.append(f"- {OUTPUT_DUPLICATES}")
+    lines.append(f"- {OUTPUT_REFERENCE_AUDIT}")
+    lines.append(f"- {OUTPUT_REFERENCE_PROBLEM_DOCS}")
     lines.append("")
 
     OUTPUT_LOG.write_text("\n".join(lines), encoding="utf-8")
 
-    # Console summary
     print(f"Audit complete for {INPUT_CSV}")
     print(f"Rows: {n_rows:,} | Columns: {n_cols:,} | Encoding: {encoding_used}")
     print(f"Missingness table: {OUTPUT_MISSINGNESS}")
     print(f"Duplicate rows: {OUTPUT_DUPLICATES}")
+    print(f"Reference-field audit: {OUTPUT_REFERENCE_AUDIT}")
+    print(f"Reference problem docs: {OUTPUT_REFERENCE_PROBLEM_DOCS}")
     print(f"Audit log: {OUTPUT_LOG}")
 
-    # Fail at the end if EID duplicates exist, after all outputs are written.
     if missing_required_columns:
         raise AssertionError(f"Missing required columns: {missing_required_columns}")
     if duplicate_eid_count > 0:
