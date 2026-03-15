@@ -99,7 +99,7 @@ VOLUME_MARKER_RE = re.compile(r"\b(?:vol\.?|volume)\s*\d+\b", re.I)
 PAGE_DEBRIS_RE = re.compile(r"\bpp?\.?\s*[A-Za-z]?\d+[A-Za-z]?(?:\s*[-–—]\s*[A-Za-z]?\d+[A-Za-z]?)?\b", re.I)
 ISSUE_DEBRIS_RE = re.compile(r"\b(?:\d+\s*\(\s*\d+\s*\)|issue\s*\d+)\b", re.I)
 PROCEEDINGS_RE = re.compile(
-    r"\b(?:in\s+)?proceedings\s+of\b|\bpaper\s+presented\s+at\b|\bconference\s+on\b|\bsymposium\s+on\b|\bworkshop\s+on\b",
+    r"\b(?:in\s+)?proceedings?\s+(?:of|sigchi|chi)\b|\bprocessings\b|\bproc\.?\s*sigchi\b|\bpaper\s+present(?:ed|ation)\s+at\b|\bconference\s+on\b|\bsymposium\s+on\b|\bworkshop\s+on\b|\bspecial\s+interest\s+group\s+on\s+computer\s+human\s+interactions\b",
     re.I,
 )
 VENUE_TAIL_RE = re.compile(
@@ -141,6 +141,8 @@ VENUE_TAIL_RE = re.compile(
         hum\.?\s*comput\.?\s*interact\.?|
         perspect\.?\s*psychol\.?\s*sci\.?|
         behav\.?\s*inf\.?\s*technol\.?|
+        res\.?\s*lang\.?\s*soc\.?\s*interact\.?|
+        research\s+on\s+language\s+and\s+social\s+interaction|
         chi\s*['’]?\d{2}|
         hicss\b|
         acm\b
@@ -183,6 +185,8 @@ AUTHOR_LEAK_RE = re.compile(r",\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*(?:
 AUTHOR_LISTISH_RE = re.compile(r"^(?:[a-z]+\s+[a-z](?:\.?\s+|\s+)){4,}[a-z]+$", re.I)
 CONTAINER_ONLY_RE = re.compile(r"^(?:in\s+)?(?:proceedings|journal|conference|symposium|workshop|handbook|annual\s+review)\b", re.I)
 SOURCE_META_RE = re.compile(r"\b(?:in\s+proceedings\s+of|proceedings\s+of|journal\s+of|transactions\s+on|pp?\.\s*\w*\d|vol(?:ume)?\.?\s*\d)\b", re.I)
+NUMERIC_SEGMENT_RE = re.compile(r"^\(?\d{1,4}\)?(?:\s*[-–—/]\s*\d{1,4})?$")
+LOW_INFO_TITLE_RE = re.compile(r"^(?:n\s*a|na|none|untitled|unknown|reference|citation)?$", re.I)
 QUALITY_PENALTY = {"high": 0, "medium": 2, "low": 6, "failed": 10}
 CONSERVATIVE_JOIN_MAP = {
     "af fordances": "affordances",
@@ -192,6 +196,7 @@ CONSERVATIVE_JOIN_MAP = {
     "coll ision": "collision",
     "a case": "acase",
     "pyschology": "psychology",
+    "technological affordances": "technology affordances",
 }
 SUSPICIOUS_TITLE_TOKENS = {
     "doi", "proceedings", "conference", "symposium", "workshop", "journal",
@@ -367,7 +372,9 @@ def normalize_display_title(title: Optional[str]) -> tuple[str, list[str]]:
     text = AUTHOR_LEAK_RE.sub("", text)
     text = LEADING_LABEL_RE.sub("", text).strip(" ,;:")
     text = TITLE_LABEL_TAIL_RE.sub(" ", text)
+    text = TRAILING_EDITION_RE.sub(" ", text)
     text = TRAILING_SOURCE_FRAGMENT_RE.sub("", text)
+    text = strip_source_tail(text)
 
     text = PUNCT_REGEX.sub(" ", text)
     text = WS_REGEX.sub(" ", text).strip()
@@ -384,6 +391,41 @@ def normalize_title(title: Optional[str]) -> tuple[str, list[str]]:
     return " ".join(tokens), tokens
 
 
+def normalize_canonical_label(title: Optional[str]) -> tuple[str, list[str]]:
+    if not title:
+        return "", []
+
+    text = unidecode(str(title)).lower().strip()
+    if not text:
+        return "", []
+
+    text = strip_doi_fragments(text)
+    text = URL_RE.sub(" ", text)
+    text = AUTHOR_LEAK_RE.sub("", text)
+    text = BRACKET_LABEL_RE.sub(" ", text)
+    text = TITLE_LABEL_TAIL_RE.sub(" ", text)
+    text = LEADING_LABEL_RE.sub(" ", text)
+    text = strip_source_tail(text)
+    text = TRAILING_VENUE_NUMERIC_RE.sub(" ", text)
+    text = TRAILING_EDITION_RE.sub(" ", text)
+    text = VOLUME_MARKER_RE.sub(" ", text)
+    text = PAGE_DEBRIS_RE.sub(" ", text)
+    text = ISSUE_DEBRIS_RE.sub(" ", text)
+    text = PROCEEDINGS_RE.sub(" ", text)
+    text = VENUE_TAIL_RE.sub(" ", text)
+    text = TRAILING_SOURCE_FRAGMENT_RE.sub("", text)
+    text = PUNCT_REGEX.sub(" ", text)
+    text = WS_REGEX.sub(" ", text).strip()
+
+    if not text:
+        return "", []
+    if AUTHOR_LISTISH_RE.match(text) or CONTAINER_ONLY_RE.match(text) or LOW_INFO_TITLE_RE.match(text):
+        return "", []
+
+    tokens = [tok for tok in text.split() if tok]
+    return " ".join(tokens), tokens
+
+
 def strip_doi_fragments(text: str) -> str:
     text = DOI_URL_REGEX.sub(" ", text)
     text = re.sub(r"\bdoi\s*[:=]?\s*", " ", text, flags=re.I)
@@ -392,27 +434,28 @@ def strip_doi_fragments(text: str) -> str:
 
 
 def strip_source_tail(text: str) -> str:
-    """Remove source/container tails with strong metadata evidence.
-
-    Important: preserve comma/semicolon structure before segmentation.
-    """
+    """Remove source/container tails while preserving initial title segment."""
     if not text:
         return ""
 
-    # Light normalization only: lowercase + ascii fold, but keep punctuation
     cleaned = unidecode(str(text)).lower().strip()
     if not cleaned:
         return ""
 
-    # Normalize whitespace but preserve commas/semicolons/parentheses for segmentation
     cleaned = WS_REGEX.sub(" ", cleaned)
-
     parts = [p.strip(" ,;:") for p in re.split(r"\s*[,;]\s*", cleaned) if p.strip(" ,;:")]
-    if len(parts) <= 1:
-        candidate = cleaned.strip(" ,;:")
-        candidate = TRAILING_SOURCE_FRAGMENT_RE.sub("", candidate).strip(" ,;:")
-        candidate = PUNCT_REGEX.sub(" ", candidate)
-        return WS_REGEX.sub(" ", candidate).strip()
+    if not parts:
+        return ""
+
+    def _is_author_leak(part: str) -> bool:
+        if AUTHOR_LEAK_RE.search(part):
+            return True
+        authorish = re.fullmatch(
+            r"(?:[a-z][a-z'\-]+\s+[a-z](?:\.[a-z])?\.?)(?:\s*(?:;|and|&)\s*[a-z][a-z'\-]+\s+[a-z](?:\.[a-z])?\.?)+",
+            part,
+            flags=re.I,
+        )
+        return bool(authorish)
 
     kept: list[str] = []
     for idx, part in enumerate(parts):
@@ -420,27 +463,23 @@ def strip_source_tail(text: str) -> str:
             kept.append(part)
             continue
 
+        plain_part = normalize_text(part)
         venue_norm = normalize_venue_equivalence(part)
         has_venue_signal = bool(
             PROCEEDINGS_RE.search(part)
             or VENUE_TAIL_RE.search(part)
-            or venue_norm != normalize_text(part)
+            or venue_norm != plain_part
         )
         has_meta_signal = bool(
-            re.search(r"\b(?:vol\.?|volume|pp?\.?|issue)\b", part, re.I)
+            re.search(r"\b(?:vol\.?|volume|pp?\.?|issue|no\.?)\b", part, re.I)
             or ISSUE_DEBRIS_RE.search(part)
             or PAGE_DEBRIS_RE.search(part)
-            or re.fullmatch(r"\(?\d{1,4}\)?", part)
+            or NUMERIC_SEGMENT_RE.fullmatch(part)
+            or re.fullmatch(r"\(?\d{4}\)?", part)
         )
-        has_author_leak = bool(
-            AUTHOR_LEAK_RE.search(part)
-            or re.search(r"(?:^|;\s*)[a-z][a-z'\-]+\s+[a-z](?:\.[a-z])?\.?(?:\s*;\s*[a-z][a-z'\-]+\s+[a-z](?:\.[a-z])?\.?)*$", part, re.I)
-        )
+        has_author_signal = idx > 0 and _is_author_leak(part)
 
-        if has_venue_signal or has_meta_signal or has_author_leak:
-            break
-
-        if TRAILING_SOURCE_FRAGMENT_RE.fullmatch(part):
+        if has_venue_signal or has_meta_signal or has_author_signal or TRAILING_SOURCE_FRAGMENT_RE.fullmatch(part):
             break
 
         kept.append(part)
@@ -449,6 +488,7 @@ def strip_source_tail(text: str) -> str:
     candidate = TRAILING_SOURCE_FRAGMENT_RE.sub("", candidate).strip(" ,;:")
     candidate = PUNCT_REGEX.sub(" ", candidate)
     return WS_REGEX.sub(" ", candidate).strip()
+
 
 def repair_ocr_breaks(text: str) -> str:
     """Repair OCR-only splits conservatively; never join arbitrary compounds."""
@@ -538,6 +578,9 @@ def normalize_work_title(title: Optional[str]) -> tuple[str, list[str]]:
     text = BRACKET_LABEL_RE.sub(" ", text)
     text = TITLE_LABEL_TAIL_RE.sub(" ", text)
     text = LEADING_LABEL_RE.sub(" ", text)
+    text = re.sub(r"\bprocessings\b", "proceedings", text)
+    text = re.sub(r"\bapporoach\b", "approach", text)
+    text = re.sub(r"\bvisuai\b", "visual", text)
     text = strip_source_tail(text)
     text = TRAILING_VENUE_NUMERIC_RE.sub(" ", text)
     text = TRAILING_EDITION_RE.sub(" ", text)
@@ -546,6 +589,10 @@ def normalize_work_title(title: Optional[str]) -> tuple[str, list[str]]:
     text = ISSUE_DEBRIS_RE.sub(" ", text)
     text = PROCEEDINGS_RE.sub(" ", text)
     text = VENUE_TAIL_RE.sub(" ", text)
+    text = re.sub(r"\bproceeding\s+of\b", " ", text)
+    text = re.sub(r"\bproceedings\s+sigchi\s+conference\s+human\s+factors\s+in\s+computer\s+systems\b", " ", text)
+    text = re.sub(r"\bspecial\s+interest\s+group\s+on\s+computer\s+human\s+interactions\b", " ", text)
+    text = re.sub(r"\bpaper\s+presentation\b", " ", text)
     text = repair_ocr_breaks(text)
 
     text = TRAILING_SOURCE_FRAGMENT_RE.sub("", text)
@@ -556,6 +603,7 @@ def normalize_work_title(title: Optional[str]) -> tuple[str, list[str]]:
 
     tokens = [tok for tok in text.split() if tok and tok not in STOPWORDS]
     return " ".join(tokens), tokens
+
 
 def normalize_author(author: Optional[str]) -> str:
     text = normalize_text(author)
@@ -737,21 +785,33 @@ def title_noise_score(raw_title: str) -> int:
 def choose_canonical(records: list[RefRecord]) -> RefRecord:
     """Choose the cleanest representative, not the longest string."""
 
-    def score(record: RefRecord) -> tuple[int, int, int, int, int, int, int, int, int, int]:
+    def is_bad_display(record: RefRecord) -> bool:
+        display = record.title_display_norm or ""
+        cleaned, _ = normalize_canonical_label(record.raw_title or display)
+        if not cleaned:
+            return True
+        if AUTHOR_LISTISH_RE.match(display) or CONTAINER_ONLY_RE.match(display):
+            return True
+        return bool(SOURCE_META_RE.search(display))
+
+    def score(record: RefRecord) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
         noise = title_noise_score(record.raw_title)
         quality_pen = QUALITY_PENALTY.get(record.raw_parse_quality, 6)
         type_pen = 8 if record.source_type_guess in {"proceedings", "editorial", "intro", "foreword", "preface", "commentary"} else 0
         low_info_pen = 8 if record.low_information_flag else 0
+        cleaned, cleaned_tokens = normalize_canonical_label(record.raw_title or record.title_display_norm)
+        bad_display_pen = 10 if is_bad_display(record) else 0
         return (
+            1 if cleaned else 0,
+            len(cleaned_tokens),
             1 if record.year is not None and record.first_author_norm else 0,
             1 if record.doi_norm and not DOI_CONTAM_RE.search(record.raw_title) else 0,
             1 if record.title_display_norm and not LEADING_LABEL_RE.search(record.title_display_norm) else 0,
-            -(noise + quality_pen + type_pen + low_info_pen),
+            -(noise + quality_pen + type_pen + low_info_pen + bad_display_pen),
             1 if record.raw_source_title and not SOURCE_META_RE.search(record.raw_source_title) else 0,
             -len(record.work_title_tokens),
             -len(record.title_display_tokens),
             -len(record.title_tokens),
-            -1 if record.title_display_norm.islower() and len(record.title_display_norm.split()) > 5 else 0,
             len(record.raw_first_author or ""),
         )
 
@@ -935,6 +995,50 @@ def is_containment_variant(rec_a: RefRecord, rec_b: RefRecord) -> bool:
     return True
 
 
+def absorb_low_information_records(records: list[RefRecord], dsu: DSU, methods: dict[Any, str]) -> None:
+    grouped: dict[tuple[str, int], list[RefRecord]] = defaultdict(list)
+    for record in records:
+        if record.first_author_norm and record.year is not None:
+            grouped[(record.first_author_norm, record.year)].append(record)
+
+    for _, group in grouped.items():
+        if len(group) < 2:
+            continue
+
+        root_counts: Counter[Any] = Counter()
+        low_info: list[RefRecord] = []
+        for record in group:
+            root = dsu.find(record.source_ref_id)
+            root_counts[root] += 1
+            if record.low_information_flag or not record.work_title_norm:
+                low_info.append(record)
+
+        if not low_info or not root_counts:
+            continue
+
+        dominant_root, dominant_size = root_counts.most_common(1)[0]
+        second_size = root_counts.most_common(2)[1][1] if len(root_counts) > 1 else 0
+        if dominant_size < 3 or dominant_size < (second_size * 2 + 1):
+            continue
+
+        dominant_members = [r for r in group if dsu.find(r.source_ref_id) == dominant_root]
+        dominant_rep = choose_canonical(dominant_members)
+        if not dominant_rep.work_title_norm:
+            continue
+
+        for record in low_info:
+            root = dsu.find(record.source_ref_id)
+            if root == dominant_root or record.doi_norm:
+                continue
+            if record.work_title_norm:
+                overlap = token_overlap(record.work_title_tokens, dominant_rep.work_title_tokens)
+                sim = float(fuzz.token_sort_ratio(record.work_title_norm, dominant_rep.work_title_norm))
+                if overlap < 0.90 or sim < 95:
+                    continue
+            dsu.union(dominant_root, root)
+            methods.setdefault(record.source_ref_id, "low_info_dominant_cluster")
+
+
 def apply_tier3_fuzzy(
     conn: sqlite3.Connection,
     records: list[RefRecord],
@@ -1091,12 +1195,14 @@ def materialize_clusters(
 
         canonical_author = canonical.raw_first_author or canonical.first_author_norm or None
         canonical_year = canonical.year
-        canonical_title = canonical.title_display_norm or canonical.raw_title or canonical.title_norm or None
+        canonical_title, _ = normalize_canonical_label(canonical.raw_title or canonical.title_display_norm)
+        canonical_title = canonical_title or canonical.title_display_norm or canonical.raw_title or canonical.title_norm or None
 
-        if not canonical_title:
+        if not canonical_title or AUTHOR_LISTISH_RE.match(canonical_title) or CONTAINER_ONLY_RE.match(canonical_title) or SOURCE_META_RE.search(canonical_title):
             for alt in sorted(members, key=lambda r: title_noise_score(r.raw_title)):
-                if alt.title_display_norm:
-                    canonical_title = alt.title_display_norm
+                alt_title, _ = normalize_canonical_label(alt.raw_title or alt.title_display_norm)
+                if alt_title:
+                    canonical_title = alt_title
                     canonical_author = canonical_author or alt.raw_first_author or alt.first_author_norm or None
                     canonical_year = canonical_year or alt.year
                     break
@@ -1379,6 +1485,7 @@ def main() -> int:
             review_title_min=args.review_title_min,
             title_overlap_min=args.title_overlap_min,
         )
+        absorb_low_information_records(records, dsu, methods)
 
         source_to_cluster = materialize_clusters(conn, records, dsu, methods)
         update_review_cluster_ids(conn, source_to_cluster)
