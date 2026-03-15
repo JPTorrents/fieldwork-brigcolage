@@ -56,6 +56,17 @@ TITLE_LABEL_RE = re.compile(
 AUTHOR_TAIL_RE = re.compile(
     r",\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*(?:;\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*)+$"
 )
+URL_RE = re.compile(r"https?://\S+", re.I)
+AUTHOR_LISTISH_RE = re.compile(r"^(?:[a-z]+\s+[a-z](?:\.?\s+|\s+)){4,}[a-z]+$", re.I)
+CONTAINER_ONLY_RE = re.compile(
+    r"^(?:in\s+)?(?:proceedings|journal|conference|symposium|workshop|handbook|annual\s+review)\b",
+    re.I,
+)
+CHAPTER_CUE_RE = re.compile(r"\b(?:in\s+|chapter\s+\d+|pp?\.\s*\w*\d)\b", re.I)
+EDITORIAL_CUE_RE = re.compile(
+    r"\b(?:editorial|guest\s+editorial|foreword|preface|introduction|commentary|editor'?s?\s+comments?)\b",
+    re.I,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -304,6 +315,66 @@ def strip_author_leakage_tail(title: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+def guess_source_type(title: Optional[str], source_title: Optional[str]) -> str:
+    text = normalize_whitespace(" ".join(part for part in [title or "", source_title or ""] if part)).lower()
+    if not text:
+        return "unknown"
+    if EDITORIAL_CUE_RE.search(text):
+        if "foreword" in text:
+            return "foreword"
+        if "preface" in text:
+            return "preface"
+        if "introduction" in text:
+            return "intro"
+        if "commentary" in text:
+            return "commentary"
+        return "editorial"
+    if PROCEEDINGS_RE.search(text):
+        return "proceedings"
+    if CHAPTER_CUE_RE.search(text) and source_title:
+        return "chapter"
+    if source_title and re.search(r"\bjournal\b|\brev(?:iew)?\b", source_title, re.I):
+        return "article"
+    if source_title and re.search(r"\bpress\b|\bpublisher\b", source_title, re.I):
+        return "book"
+    return "unknown"
+
+
+def title_contamination_score(title: Optional[str], source_title: Optional[str]) -> int:
+    text = normalize_whitespace(" ".join(part for part in [title or "", source_title or ""] if part)).lower()
+    if not text:
+        return 10
+    penalty = 0
+    penalty += 4 if DOI_RE.search(text) or DOI_URL_RE.search(text) or URL_RE.search(text) else 0
+    penalty += 3 if re.search(r"\bpp?\.?\s*\w*\d|\bvol(?:ume)?\.?\s*\d|\bissue\s*\d", text) else 0
+    penalty += 3 if PROCEEDINGS_RE.search(text) else 0
+    penalty += 3 if EDITORIAL_CUE_RE.search(text) else 0
+    penalty += 3 if AUTHOR_LISTISH_RE.match(text) else 0
+    penalty += 2 if VENUE_SPLIT_HINT_RE.search(text) else 0
+    return penalty
+
+
+def has_author_leakage(title: Optional[str]) -> bool:
+    if not title:
+        return False
+    return bool(AUTHOR_TAIL_RE.search(title) or AUTHOR_LISTISH_RE.match(text_norm(title) or ""))
+
+
+def is_low_information_record(first_author: Optional[str], year: Optional[int], title: Optional[str], parse_hint: str) -> bool:
+    if parse_hint == "failed":
+        return True
+    t = text_norm(title) or ""
+    if not t:
+        return True
+    if CONTAINER_ONLY_RE.match(t):
+        return True
+    if has_author_leakage(title):
+        return True
+    if len(t.split()) < 3 and not (first_author and year):
+        return True
+    return False
+
+
 def clean_title_candidate(title: Optional[str], source_title: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     if not title:
         return None, source_title
@@ -390,11 +461,15 @@ def score_parse_quality(
             return "medium"
         return "low"
 
+    contamination = title_contamination_score(title, source_title)
+
     if first_author and year and title:
         if len(title) >= 12 and not re.fullmatch(r"[A-Z][a-z]?$", title):
             if TRUNCATED_SOURCE_TAIL_RE.match(title) or len(title.split()) == 1:
                 return "medium"
             if TITLE_LABEL_RE.match(title) and not source_title:
+                return "medium"
+            if contamination >= 6:
                 return "medium"
             return "high"
 
@@ -421,6 +496,14 @@ def parse_reference(raw: str) -> dict[str, Any]:
         source_title = "front-matter-label"
 
     parse_quality = score_parse_quality(raw, first_author, year, title, source_title)
+    source_type_guess = guess_source_type(title, source_title)
+    contamination = title_contamination_score(title, source_title)
+    low_info = is_low_information_record(first_author, year, title, parse_quality)
+
+    if source_type_guess in {"proceedings", "editorial", "intro", "foreword", "preface", "commentary"} and parse_quality == "high":
+        parse_quality = "medium"
+    if (low_info or contamination >= 8) and parse_quality in {"high", "medium"}:
+        parse_quality = "low"
 
     return {
         "first_author": first_author,
@@ -433,6 +516,11 @@ def parse_reference(raw: str) -> dict[str, Any]:
         "doi": doi,
         "ref_string_norm": normalize_ref_string(raw),
         "parse_quality": parse_quality,
+        "_source_type_guess": source_type_guess,
+        "_title_contamination_score": contamination,
+        "_author_leakage_flag": has_author_leakage(title),
+        "_container_only_flag": bool(CONTAINER_ONLY_RE.match(text_norm(title) or "")),
+        "_low_information_flag": low_info,
     }
 
 
