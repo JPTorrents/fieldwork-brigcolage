@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Normalize parsed cited references into conservative deduplicated clusters."""
+"""Normalize parsed cited references into conservative deduplicated work clusters."""
 
 from __future__ import annotations
 
@@ -8,10 +8,9 @@ import hashlib
 import re
 import sqlite3
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
-from collections import Counter
 
 try:
     from rapidfuzz import fuzz
@@ -46,16 +45,57 @@ STOPWORDS = {
 }
 
 DOI_REGEX = re.compile(r"(?i)\b(10\.\d{4,9}/[-._;()/:a-z0-9]+)\b")
+DOI_URL_REGEX = re.compile(r"(?i)https?://(?:dx\.)?doi\.org/\S+")
 YEAR_REGEX = re.compile(r"\b(?:18|19|20)\d{2}\b")
 PUNCT_REGEX = re.compile(r"[^\w\s]")
 WS_REGEX = re.compile(r"\s+")
 
+BRACKET_LABEL_RE = re.compile(r"\[(?:[A-Za-z]{1,3}|\d+\s*paragraphs?)\]")
+EDITION_RE = re.compile(
+    r"\b(?:\d{1,2}(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+ed(?:ition)?\b",
+    re.I,
+)
+VOLUME_MARKER_RE = re.compile(r"\b(?:vol\.?|volume)\s*\d+\b", re.I)
+PAGE_DEBRIS_RE = re.compile(r"\bpp?\.?\s*\d+[A-Za-z0-9\-–—]*\b", re.I)
+ISSUE_DEBRIS_RE = re.compile(r"\b\d+\s*\(\s*\d+\s*\)\b")
+PROCEEDINGS_RE = re.compile(
+    r"\b(?:in\s+)?proceedings\s+of\b|\bpaper\s+presented\s+at\b|\bconference\s+on\b|\bsymposium\s+on\b|\bworkshop\s+on\b",
+    re.I,
+)
+VENUE_TAIL_RE = re.compile(
+    r"\b(?:journal\s+of|transactions\s+on|mis\s*q\b|acad\.?\s*manag\.?\s*rev\.?\b|chi\s*['’]?\d{2}|hicss\b)\b",
+    re.I,
+)
+SUSPICIOUS_TITLE_TOKENS = {
+    "doi", "proceedings", "conference", "symposium", "workshop", "journal",
+    "transactions", "vol", "volume", "issue", "pp", "pages", "presented",
+}
+OCR_SPLIT_RE = re.compile(r"\b([a-z]{2,})\s*[-‐]\s+([a-z]{2,})\b")
+OCR_JOIN_RE = re.compile(r"\b(human)\s+(computer)\b|\b(coll)\s+(ision)\b", re.I)
+
 DEFAULT_AUTO_TITLE_THRESHOLD = 92
 DEFAULT_REVIEW_TITLE_MIN = 85
 DEFAULT_TITLE_OVERLAP_MIN = 0.50
+CONTAINMENT_AUTO_SIM_MIN = 90
+CONTAINMENT_AUTO_OVERLAP_MIN = 0.85
 
 INTERNAL_CITATION_TITLE_OVERLAP_MIN = 0.50
 INTERNAL_CITATION_TITLE_SIM_MIN = 92
+
+UK_US_MAP = {
+    "behaviour": "behavior",
+    "organisation": "organization",
+    "organisations": "organizations",
+    "organise": "organize",
+    "organised": "organized",
+    "colour": "color",
+    "labour": "labor",
+    "centre": "center",
+    "modelling": "modeling",
+    "analyse": "analyze",
+    "analysed": "analyzed",
+    "catalogue": "catalog",
+}
 
 
 @dataclass
@@ -68,11 +108,15 @@ class RefRecord:
     raw_doi: str
     title_norm: str
     title_tokens: list[str]
+    work_title_norm: str
+    work_title_tokens: list[str]
     title_key8: str
+    work_key8: str
     first_author_norm: str
     year: Optional[int]
     doi_norm: str
     exact_key: str
+    work_exact_key: str
 
 
 class DSU:
@@ -107,16 +151,79 @@ def as_str_id(value: Any) -> str:
 def normalize_text(text: Optional[str]) -> str:
     if not text:
         return ""
-    text = unidecode(str(text)).lower()
-    text = PUNCT_REGEX.sub(" ", text)
-    text = WS_REGEX.sub(" ", text).strip()
-    return text
+    normalized = unidecode(str(text)).lower()
+    normalized = PUNCT_REGEX.sub(" ", normalized)
+    normalized = WS_REGEX.sub(" ", normalized).strip()
+    return normalized
 
 
 def normalize_title(title: Optional[str]) -> tuple[str, list[str]]:
     text = normalize_text(title)
     if not text:
         return "", []
+    tokens = [tok for tok in text.split() if tok and tok not in STOPWORDS]
+    return " ".join(tokens), tokens
+
+
+def strip_doi_fragments(text: str) -> str:
+    text = DOI_URL_REGEX.sub(" ", text)
+    text = re.sub(r"\bdoi\s*[:=]?\s*", " ", text, flags=re.I)
+    text = DOI_REGEX.sub(" ", text)
+    return text
+
+
+def strip_source_tail(text: str) -> str:
+    """Remove obvious source/proceedings tails appended to a title field."""
+    parts = [p.strip() for p in re.split(r"\s*[,;:]\s*", text) if p.strip()]
+    if len(parts) <= 1:
+        return text
+
+    kept: list[str] = []
+    for idx, part in enumerate(parts):
+        if idx > 0 and (PROCEEDINGS_RE.search(part) or VENUE_TAIL_RE.search(part)):
+            break
+        if idx > 0 and re.search(r"\b(?:vol\.?|volume|pp?\.?|issue)\b", part, re.I):
+            break
+        kept.append(part)
+
+    return ", ".join(kept) if kept else parts[0]
+
+
+def repair_ocr_breaks(text: str) -> str:
+    text = OCR_SPLIT_RE.sub(r"\1\2", text)
+    text = OCR_JOIN_RE.sub(lambda m: "".join(tok for tok in m.groups() if tok), text)
+    text = re.sub(r"\bna ture\b", "nature", text, flags=re.I)
+    text = re.sub(r"\bconcep tual\b", "conceptual", text, flags=re.I)
+    return text
+
+
+def normalize_spelling_for_match(text: str) -> str:
+    tokens = text.split()
+    mapped = [UK_US_MAP.get(token, token) for token in tokens]
+    return " ".join(mapped)
+
+
+def normalize_work_title(title: Optional[str]) -> tuple[str, list[str]]:
+    """Aggressive work-level normalization used for clustering keys and matching only."""
+    if not title:
+        return "", []
+
+    text = unidecode(str(title)).lower()
+    text = strip_doi_fragments(text)
+    text = BRACKET_LABEL_RE.sub(" ", text)
+    text = strip_source_tail(text)
+    text = EDITION_RE.sub(" ", text)
+    text = VOLUME_MARKER_RE.sub(" ", text)
+    text = PAGE_DEBRIS_RE.sub(" ", text)
+    text = ISSUE_DEBRIS_RE.sub(" ", text)
+    text = PROCEEDINGS_RE.sub(" ", text)
+    text = VENUE_TAIL_RE.sub(" ", text)
+    text = repair_ocr_breaks(text)
+
+    text = PUNCT_REGEX.sub(" ", text)
+    text = normalize_spelling_for_match(text)
+    text = WS_REGEX.sub(" ", text).strip()
+
     tokens = [tok for tok in text.split() if tok and tok not in STOPWORDS]
     return " ".join(tokens), tokens
 
@@ -270,13 +377,35 @@ def ensure_output_tables(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
 
 
+def title_noise_score(raw_title: str) -> int:
+    normalized = normalize_text(raw_title)
+    if not normalized:
+        return 100
+    penalty = 0
+    tokens = normalized.split()
+    suspicious = sum(1 for token in tokens if token in SUSPICIOUS_TITLE_TOKENS)
+    penalty += suspicious * 3
+    penalty += 4 if DOI_REGEX.search(raw_title) or DOI_URL_REGEX.search(raw_title) else 0
+    penalty += 2 if EDITION_RE.search(raw_title) else 0
+    penalty += 2 if BRACKET_LABEL_RE.search(raw_title) else 0
+    penalty += 2 if re.search(r"\b\w+[-‐]\s+\w+\b", raw_title) else 0
+    penalty += 1 if PROCEEDINGS_RE.search(raw_title) else 0
+    penalty += 1 if VENUE_TAIL_RE.search(raw_title) else 0
+    return penalty
+
+
 def choose_canonical(records: list[RefRecord]) -> RefRecord:
-    def score(record: RefRecord) -> tuple[int, int, int, int]:
+    """Choose the cleanest representative, not the longest string."""
+
+    def score(record: RefRecord) -> tuple[int, int, int, int, int, int]:
+        noise = title_noise_score(record.raw_title)
         return (
             1 if record.doi_norm else 0,
-            len(record.title_norm),
-            len(record.raw_first_author or ""),
+            -noise,
+            len(record.work_title_tokens),
+            len(record.title_tokens),
             1 if record.year is not None else 0,
+            len(record.raw_first_author or ""),
         )
 
     return sorted(records, key=score, reverse=True)[0]
@@ -285,16 +414,16 @@ def choose_canonical(records: list[RefRecord]) -> RefRecord:
 def cluster_confidence_for_members(records: list[RefRecord]) -> tuple[str, str]:
     if any(record.doi_norm for record in records):
         return "high", "doi_exact"
-    exact_keys = {record.exact_key for record in records if record.exact_key}
+    exact_keys = {record.work_exact_key for record in records if record.work_exact_key}
     if len(exact_keys) == 1 and exact_keys:
-        return "high", "exact_key"
+        return "high", "work_exact_key"
     return "medium", "fuzzy_title"
 
 
 def detect_source_rows(conn: sqlite3.Connection, refs_table: str) -> list[dict[str, Any]]:
     columns = fetch_table_columns(conn, refs_table)
 
-    ref_id_col = resolve_column(columns, ["cited_ref_id", "reference_id", "id"], refs_table)
+    ref_id_col = resolve_column(columns, ["cited_ref_id", "reference_id", "id", "raw_ref_id"], refs_table)
     doc_id_col = resolve_column(columns, ["doc_id", "source_doc_id", "document_id", "citing_doc_id"], refs_table)
     title_col = resolve_column(columns, ["title_candidate", "title", "ref_title", "parsed_title"], refs_table)
     author_col = resolve_column(columns, ["first_author", "author", "ref_first_author", "parsed_first_author"], refs_table)
@@ -327,12 +456,18 @@ def build_ref_records(rows: list[dict[str, Any]]) -> list[RefRecord]:
 
         doi_norm = normalize_doi(raw_doi)
         title_norm, title_tokens = normalize_title(raw_title)
+        work_title_norm, work_title_tokens = normalize_work_title(raw_title)
         first_author_norm = normalize_author(raw_first_author)
         title_key8 = "_".join(title_tokens[:8]) if title_tokens else ""
+        work_key8 = "_".join(work_title_tokens[:8]) if work_title_tokens else ""
 
         exact_key = ""
         if first_author_norm and year and title_key8:
             exact_key = f"{first_author_norm}_{year}_{title_key8}"
+
+        work_exact_key = ""
+        if first_author_norm and year and work_key8:
+            work_exact_key = f"{first_author_norm}_{year}_{work_key8}"
 
         records.append(
             RefRecord(
@@ -344,11 +479,15 @@ def build_ref_records(rows: list[dict[str, Any]]) -> list[RefRecord]:
                 raw_doi=raw_doi,
                 title_norm=title_norm,
                 title_tokens=title_tokens,
+                work_title_norm=work_title_norm,
+                work_title_tokens=work_title_tokens,
                 title_key8=title_key8,
+                work_key8=work_key8,
                 first_author_norm=first_author_norm,
                 year=year,
                 doi_norm=doi_norm,
                 exact_key=exact_key,
+                work_exact_key=work_exact_key,
             )
         )
 
@@ -381,17 +520,44 @@ def apply_tier2_exact_key(records: list[RefRecord], dsu: DSU, methods: dict[Any,
     for record in records:
         if record.doi_norm:
             continue
-        if record.exact_key:
-            by_key[record.exact_key].append(record)
+        if record.work_exact_key:
+            by_key[record.work_exact_key].append(record)
 
     for members in by_key.values():
         if len(members) < 2:
             continue
         anchor = members[0].source_ref_id
-        methods.setdefault(anchor, "exact_key")
+        methods.setdefault(anchor, "work_exact_key")
         for member in members[1:]:
             dsu.union(anchor, member.source_ref_id)
-            methods.setdefault(member.source_ref_id, "exact_key")
+            methods.setdefault(member.source_ref_id, "work_exact_key")
+
+
+def is_containment_variant(rec_a: RefRecord, rec_b: RefRecord) -> bool:
+    """Return True when one work title is mostly another plus metadata debris."""
+    if not rec_a.work_title_norm or not rec_b.work_title_norm:
+        return False
+
+    shorter, longer = (rec_a, rec_b)
+    if len(rec_a.work_title_tokens) > len(rec_b.work_title_tokens):
+        shorter, longer = rec_b, rec_a
+
+    if len(shorter.work_title_tokens) < 4:
+        return False
+
+    overlap = token_overlap(shorter.work_title_tokens, longer.work_title_tokens)
+    if overlap < CONTAINMENT_AUTO_OVERLAP_MIN:
+        return False
+
+    sim = float(fuzz.partial_ratio(shorter.work_title_norm, longer.work_title_norm))
+    if sim < CONTAINMENT_AUTO_SIM_MIN:
+        return False
+
+    longer_extra = set(longer.work_title_tokens) - set(shorter.work_title_tokens)
+    if len(longer_extra) > max(6, len(shorter.work_title_tokens) // 2):
+        return False
+
+    return True
 
 
 def apply_tier3_fuzzy(
@@ -406,7 +572,7 @@ def apply_tier3_fuzzy(
     grouped: dict[tuple[str, int], list[RefRecord]] = defaultdict(list)
 
     for record in records:
-        if not record.first_author_norm or record.year is None or not record.title_norm:
+        if not record.first_author_norm or record.year is None or not record.work_title_norm:
             continue
         grouped[(record.first_author_norm, record.year)].append(record)
 
@@ -431,16 +597,18 @@ def apply_tier3_fuzzy(
                 if root_i == root_j:
                     continue
 
-                overlap = token_overlap(rec_i.title_tokens, rec_j.title_tokens)
+                overlap = token_overlap(rec_i.work_title_tokens, rec_j.work_title_tokens)
                 if overlap < title_overlap_min:
                     continue
 
-                similarity = float(fuzz.token_sort_ratio(rec_i.title_norm, rec_j.title_norm))
+                similarity = float(fuzz.token_sort_ratio(rec_i.work_title_norm, rec_j.work_title_norm))
+                containment = is_containment_variant(rec_i, rec_j)
 
-                if similarity >= auto_title_threshold:
+                if similarity >= auto_title_threshold or containment:
                     if dsu.union(root_i, root_j):
-                        methods.setdefault(rec_i.source_ref_id, "fuzzy_title")
-                        methods.setdefault(rec_j.source_ref_id, "fuzzy_title")
+                        method = "containment_title" if containment and similarity < auto_title_threshold else "fuzzy_work_title"
+                        methods.setdefault(rec_i.source_ref_id, method)
+                        methods.setdefault(rec_j.source_ref_id, method)
                 elif review_title_min <= similarity < auto_title_threshold:
                     review_rows.append(
                         (
@@ -456,7 +624,7 @@ def apply_tier3_fuzzy(
                             similarity,
                             float(overlap),
                             "manual_review",
-                            "same_author_same_year_overlap_borderline_title_similarity",
+                            "same_author_same_year_work_title_borderline_similarity",
                         )
                     )
 
@@ -494,10 +662,10 @@ def materialize_clusters(
     def build_cluster_seed(canonical: RefRecord, root: Any) -> str:
         if canonical.doi_norm:
             return f"doi::{canonical.doi_norm}"
-        if canonical.exact_key:
-            return f"key::{canonical.exact_key}"
-        if canonical.first_author_norm and canonical.year and canonical.title_norm:
-            return f"meta::{canonical.first_author_norm}|{canonical.year}|{canonical.title_norm}"
+        if canonical.work_exact_key:
+            return f"key::{canonical.work_exact_key}"
+        if canonical.first_author_norm and canonical.year and canonical.work_title_norm:
+            return f"meta::{canonical.first_author_norm}|{canonical.year}|{canonical.work_title_norm}"
         return f"root::{as_str_id(root)}"
 
     def make_unique_cluster_id(seed: str, root: Any) -> str:
@@ -548,7 +716,7 @@ def materialize_clusters(
             source_to_cluster[source_ref_id] = cluster_id
 
             link_method = methods.get(member.source_ref_id, cluster_method)
-            link_confidence = "high" if link_method in {"doi_exact", "exact_key"} else confidence
+            link_confidence = "high" if link_method in {"doi_exact", "work_exact_key"} else confidence
 
             link_rows.append(
                 (
@@ -559,13 +727,13 @@ def materialize_clusters(
                     link_confidence,
                 )
             )
-    
+
     cluster_id_counts = Counter(row[0] for row in cluster_rows)
     duplicate_cluster_ids = {cid: n for cid, n in cluster_id_counts.items() if n > 1}
     if duplicate_cluster_ids:
         raise RuntimeError(
             f"Duplicate cluster_ids generated before insert: {list(duplicate_cluster_ids.items())[:10]}"
-    )
+        )
 
     conn.executemany(
         """
@@ -589,6 +757,7 @@ def materialize_clusters(
 
     conn.commit()
     return source_to_cluster
+
 
 def update_review_cluster_ids(conn: sqlite3.Connection, source_to_cluster: dict[str, str]) -> None:
     rows = conn.execute(

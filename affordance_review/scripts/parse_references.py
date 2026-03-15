@@ -14,6 +14,8 @@ from unidecode import unidecode
 DB_PATH = Path("data/processed/affordance_lit.sqlite")
 
 DOI_RE = re.compile(r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", re.I)
+DOI_URL_RE = re.compile(r"https?://(?:dx\.)?doi\.org/\S+", re.I)
+DOI_PREFIX_RE = re.compile(r"\bdoi\s*[:=]?\s*(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", re.I)
 YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
 PAREN_YEAR_RE = re.compile(r"\((19\d{2}|20\d{2})\)")
 PAGES_RE = re.compile(
@@ -24,6 +26,18 @@ VOL_ISSUE_RE = re.compile(r",\s*(\d{1,4})\s*,\s*([A-Za-z0-9\-]{1,20})(?=,|\s*\(|
 VOL_ONLY_RE = re.compile(r",\s*(\d{1,4})(?=,?\s*pp?\.|,?\s*\(|\s*$)", re.I)
 SPACE_RE = re.compile(r"\s+")
 TRAILING_PUNCT_RE = re.compile(r"[\s,;:.]+$")
+EDITION_RE = re.compile(
+    r"\b(?:\d{1,2}(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+ed(?:ition)?\b",
+    re.I,
+)
+VENUE_SPLIT_HINT_RE = re.compile(
+    r"\b(?:proceedings\s+of|paper\s+presented\s+at|conference\s+on|international\s+conference|symposium\s+on|workshop\s+on|journal\s+of|transactions\s+on|mis\s+q\b|acad\.?\s*manag\.?\s*rev\.?\b|chi\s*['’]?\d{2})\b",
+    re.I,
+)
+SOURCE_BOILERPLATE_RE = re.compile(
+    r"\b(?:proceedings\s+of\s+the|in\s+proceedings\s+of|paper\s+presented\s+at|conference\s+on|symposium\s+on|workshop\s+on|journal\s+of|transactions\s+on|mis\s+q\.?|acad\.?\s*manag\.?\s*rev\.?)\b",
+    re.I,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +79,14 @@ def normalize_ref_string(text: Optional[str]) -> Optional[str]:
     return text or None
 
 
+def strip_doi_noise(raw: str) -> str:
+    """Remove DOI URLs/fragments so they do not pollute title/source extraction."""
+    cleaned = DOI_URL_RE.sub(" ", raw)
+    cleaned = DOI_PREFIX_RE.sub(" ", cleaned)
+    cleaned = DOI_RE.sub(" ", cleaned)
+    return normalize_whitespace(cleaned)
+
+
 def extract_doi(raw: str) -> Optional[str]:
     m = DOI_RE.search(raw)
     return normalize_doi(m.group(1)) if m else None
@@ -79,7 +101,17 @@ def extract_year(raw: str) -> Optional[int]:
 
 
 def strip_doi(raw: str) -> str:
-    return DOI_RE.sub("", raw)
+    return strip_doi_noise(raw)
+
+
+def strip_reference_prefix_noise(raw: str) -> str:
+    """Drop leading labels and boilerplate that are not bibliographic content."""
+    text = raw.strip()
+    text = re.sub(r"^\s*\[\d+\]\s*", "", text)
+    text = re.sub(r"^\s*\(?\d+\)?[\.)]\s*", "", text)
+    text = re.sub(r"^[\"'“”‘’]\s*", "", text)
+    text = re.sub(r"\s*[\"'“”‘’]\s*$", "", text)
+    return normalize_whitespace(text)
 
 
 def strip_terminal_year_block(raw: str) -> tuple[str, Optional[int]]:
@@ -160,6 +192,15 @@ def split_author_and_rest(raw: str) -> tuple[Optional[str], str]:
     return None, s
 
 
+def strip_edition_markers(text: str) -> tuple[str, Optional[str]]:
+    """Extract edition markers from a title-like segment."""
+    match = EDITION_RE.search(text)
+    marker = normalize_whitespace(match.group(0)) if match else None
+    cleaned = EDITION_RE.sub(" ", text)
+    cleaned = re.sub(r"\b(?:vol\.?|volume)\s*\d+\b", " ", cleaned, flags=re.I)
+    return normalize_whitespace(cleaned.strip(" ,;:")), marker
+
+
 def extract_pages(text: str) -> Optional[str]:
     m = PAGES_RE.search(text)
     if m:
@@ -196,42 +237,45 @@ def strip_right_metadata(text: str) -> tuple[str, Optional[str], Optional[str], 
     return working, volume, issue, pages
 
 
+def split_title_source_by_hints(working: str) -> tuple[str, Optional[str]]:
+    """Split residual citation text into title and source using venue/proceedings hints."""
+    match = VENUE_SPLIT_HINT_RE.search(working)
+    if match and match.start() > 10:
+        left = working[: match.start()].strip(" ,;:.-")
+        right = working[match.start() :].strip(" ,;:.-")
+        if left and right:
+            return left, right
+
+    parts = [p.strip(" ,;:.") for p in working.split(",") if p.strip(" ,;:.")]
+    if len(parts) >= 3:
+        return ", ".join(parts[:-1]).strip(), parts[-1].strip()
+    if len(parts) == 2:
+        left, right = parts
+        if VENUE_SPLIT_HINT_RE.search(right) or len(right.split()) >= 3:
+            return left, right
+    return working.strip(" ,;:."), None
+
+
 def split_title_and_source(rest: str) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
     if not rest:
         return None, None, None, None, None
 
-    working = normalize_whitespace(strip_doi(rest))
+    working = strip_reference_prefix_noise(rest)
+    working = normalize_whitespace(strip_doi(working))
     working, _ = strip_terminal_year_block(working)
     working, volume, issue, pages = strip_right_metadata(working)
 
     if not working:
         return None, None, volume, issue, pages
 
-    # Prefer a right-biased split: source title tends to be the final comma-separated segment
-    parts = [p.strip(" ,;:.") for p in working.split(",") if p.strip(" ,;:.")]
-
-    title = None
-    source_title = None
-
-    if len(parts) >= 3:
-        title = ", ".join(parts[:-1]).strip()
-        source_title = parts[-1].strip()
-    elif len(parts) == 2:
-        left, right = parts
-        if len(right.split()) >= 2:
-            title = left
-            source_title = right
-        else:
-            title = working
-            source_title = None
-    else:
-        title = parts[0]
-        source_title = None
+    title, source_title = split_title_source_by_hints(working)
+    title, _edition_marker = strip_edition_markers(title)
 
     if title:
         title = normalize_whitespace(title.strip(" \"'“”‘’"))
     if source_title:
         source_title = normalize_whitespace(source_title.strip(" \"'“”‘’"))
+        source_title = SOURCE_BOILERPLATE_RE.sub(lambda m: normalize_whitespace(m.group(0)), source_title)
 
     if title and re.search(r"\bpp?\.\b", title, re.I):
         title = re.sub(r",?\s*pp?\..*$", "", title, flags=re.I).strip(" ,;:.") or None
