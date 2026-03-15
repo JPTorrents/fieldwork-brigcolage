@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 from pathlib import Path
 import sqlite3
 
@@ -35,7 +37,8 @@ CREATE TABLE IF NOT EXISTS authors (
     scopus_author_id TEXT,
     author_full_name TEXT,
     author_display_name TEXT,
-    author_name_norm TEXT
+    author_name_norm TEXT,
+    UNIQUE (scopus_author_id, author_full_name, author_display_name)
 );
 
 CREATE TABLE IF NOT EXISTS document_authors (
@@ -116,29 +119,68 @@ CREATE TABLE IF NOT EXISTS cited_references (
 );
 
 CREATE TABLE IF NOT EXISTS reference_clusters (
-    ref_cluster_id INTEGER PRIMARY KEY,
+    cluster_id TEXT PRIMARY KEY,
     canonical_first_author TEXT,
     canonical_year INTEGER,
     canonical_title TEXT,
     canonical_source_title TEXT,
     canonical_doi TEXT,
     cluster_method TEXT,
-    cluster_confidence REAL CHECK (
-        cluster_confidence IS NULL OR
-        (cluster_confidence >= 0.0 AND cluster_confidence <= 1.0)
-    )
+    cluster_confidence TEXT,
+    member_count INTEGER,
+    source_ref_ids TEXT
 );
 
 CREATE TABLE IF NOT EXISTS document_reference_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     doc_id INTEGER NOT NULL,
-    ref_cluster_id INTEGER NOT NULL,
-    PRIMARY KEY (doc_id, ref_cluster_id),
+    source_ref_id INTEGER,
+    cluster_id TEXT NOT NULL,
+    link_method TEXT,
+    link_confidence TEXT,
+    UNIQUE (doc_id, source_ref_id),
     FOREIGN KEY (doc_id) REFERENCES documents(doc_id)
         ON UPDATE CASCADE
         ON DELETE CASCADE,
-    FOREIGN KEY (ref_cluster_id) REFERENCES reference_clusters(ref_cluster_id)
+    FOREIGN KEY (cluster_id) REFERENCES reference_clusters(cluster_id)
         ON UPDATE CASCADE
         ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS reference_cluster_review (
+    review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref_id_1 INTEGER,
+    ref_id_2 INTEGER,
+    cluster_id_1 TEXT,
+    cluster_id_2 TEXT,
+    first_author_norm TEXT,
+    year_1 INTEGER,
+    year_2 INTEGER,
+    title_1 TEXT,
+    title_2 TEXT,
+    title_similarity REAL,
+    title_overlap REAL,
+    suggested_action TEXT,
+    reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS internal_citations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    citing_doc_id INTEGER NOT NULL,
+    cited_doc_id INTEGER NOT NULL,
+    cluster_id TEXT,
+    match_method TEXT,
+    match_confidence TEXT,
+    UNIQUE (citing_doc_id, cited_doc_id, cluster_id),
+    FOREIGN KEY (citing_doc_id) REFERENCES documents(doc_id)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+    FOREIGN KEY (cited_doc_id) REFERENCES documents(doc_id)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+    FOREIGN KEY (cluster_id) REFERENCES reference_clusters(cluster_id)
+        ON UPDATE CASCADE
+        ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_documents_year
@@ -166,10 +208,17 @@ CREATE INDEX IF NOT EXISTS idx_cited_references_first_author_year
     ON cited_references(first_author, year);
 
 CREATE INDEX IF NOT EXISTS idx_document_reference_links_doc_ref
-    ON document_reference_links(doc_id, ref_cluster_id);
+    ON document_reference_links(doc_id, cluster_id);
+
+CREATE INDEX IF NOT EXISTS idx_reference_clusters_canonical_doi
+    ON reference_clusters(canonical_doi);
+
+CREATE INDEX IF NOT EXISTS idx_internal_citations_docs
+    ON internal_citations(citing_doc_id, cited_doc_id);
 
 COMMIT;
 """
+
 
 def main() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +231,7 @@ def main() -> None:
         conn.close()
 
     print(f"Initialized SQLite database at: {DB_PATH}")
+
 
 if __name__ == "__main__":
     main()
