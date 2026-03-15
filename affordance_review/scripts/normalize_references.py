@@ -75,6 +75,10 @@ OCR_HYPHEN_BREAK_RE = re.compile(r"\b([a-z]{3,})\s*[-‐]\s*([a-z]{3,})\b", re.I
 OCR_SPACE_BREAK_RE = re.compile(r"\b([a-z]{1,3})\s+([a-z]{5,})\b", re.I)
 LEADING_LABEL_RE = re.compile(r"^(?:introduction|foreword|preface|editor'?s?\s+comments?|editorial|guest\s+editorial|commentary)\b", re.I)
 AUTHOR_LEAK_RE = re.compile(r",\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*(?:;\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*)+$")
+AUTHOR_LISTISH_RE = re.compile(r"^(?:[a-z]+\s+[a-z](?:\.?\s+|\s+)){4,}[a-z]+$", re.I)
+CONTAINER_ONLY_RE = re.compile(r"^(?:in\s+)?(?:proceedings|journal|conference|symposium|workshop|handbook|annual\s+review)\b", re.I)
+SOURCE_META_RE = re.compile(r"\b(?:in\s+proceedings\s+of|proceedings\s+of|journal\s+of|transactions\s+on|pp?\.\s*\w*\d|vol(?:ume)?\.?\s*\d)\b", re.I)
+QUALITY_PENALTY = {"high": 0, "medium": 2, "low": 6, "failed": 10}
 CONSERVATIVE_JOIN_MAP = {
     "af fordances": "affordances",
     "aff ordances": "affordances",
@@ -116,6 +120,36 @@ UK_US_MAP = {
 
 
 VENUE_ABBREV_MAP = {
+    "interactive learning environments": "interactive learning environments",
+    "interact learn environ": "interactive learning environments",
+    "qualitative inquiry": "qualitative inquiry",
+    "qual inq": "qualitative inquiry",
+    "management science": "management science",
+    "manage sci": "management science",
+    "information management": "information management",
+    "inform manag": "information management",
+    "information systems research": "information systems research",
+    "inf syst res": "information systems research",
+    "cognitive science": "cognitive science",
+    "cogn sci": "cognitive science",
+    "emotion review": "emotion review",
+    "emot rev": "emotion review",
+    "harvard business review": "harvard business review",
+    "harv bus rev": "harvard business review",
+    "strategic management journal": "strategic management journal",
+    "strateg manag j": "strategic management journal",
+    "organization studies": "organization studies",
+    "organ stud": "organization studies",
+    "teaching in higher education": "teaching in higher education",
+    "teach high educ": "teaching in higher education",
+    "body society": "body society",
+    "body soc": "body society",
+    "annual review of sociology": "annual review of sociology",
+    "annu rev sociol": "annual review of sociology",
+    "assessment evaluation in higher education": "assessment evaluation in higher education",
+    "assess eval high educ": "assessment evaluation in higher education",
+    "academy of management journal": "academy of management journal",
+    "acad manag j": "academy of management journal",
     "psychol bull": "psychological bulletin",
     "acad med": "academic medicine",
     "organ sci": "organization science",
@@ -132,6 +166,8 @@ class RefRecord:
     raw_first_author: str
     raw_year: Optional[int]
     raw_doi: str
+    raw_source_title: str
+    raw_parse_quality: str
     title_display_norm: str
     title_display_tokens: list[str]
     title_norm: str
@@ -145,6 +181,9 @@ class RefRecord:
     doi_norm: str
     exact_key: str
     work_exact_key: str
+    source_title_norm: str
+    source_type_guess: str
+    low_information_flag: bool
 
 
 class DSU:
@@ -267,6 +306,56 @@ def normalize_spelling_for_match(text: str) -> str:
     tokens = text.split()
     mapped = [UK_US_MAP.get(token, token) for token in tokens]
     return " ".join(mapped)
+
+
+def normalize_venue_equivalence(text: str) -> str:
+    """Collapse routine journal abbreviation/full-form variants for matching only."""
+    normalized = normalize_text(text)
+    if not normalized:
+        return ""
+    normalized = re.sub(r"\b([a-z]{3,})\.\b", r"\1", normalized)
+    normalized = normalized.replace("&", " and ")
+    normalized = WS_REGEX.sub(" ", normalized).strip()
+    for short, long_form in VENUE_ABBREV_MAP.items():
+        normalized = re.sub(rf"\b{re.escape(short)}\b", long_form, normalized)
+    return WS_REGEX.sub(" ", normalized).strip()
+
+
+def guess_source_type(raw_title: str, raw_source_title: str) -> str:
+    text = normalize_text(f"{raw_title} {raw_source_title}")
+    if not text:
+        return "unknown"
+    if re.search(r"\bforeword\b", text):
+        return "foreword"
+    if re.search(r"\bpreface\b", text):
+        return "preface"
+    if re.search(r"\bintroduction\b", text):
+        return "intro"
+    if re.search(r"\b(?:editorial|guest editorial|editor s comments?)\b", text):
+        return "editorial"
+    if re.search(r"\bcommentary\b", text):
+        return "commentary"
+    if PROCEEDINGS_RE.search(text):
+        return "proceedings"
+    if re.search(r"\bin\b", text) and ("handbook" in text or "chapter" in text):
+        return "chapter"
+    if "journal" in text or "review" in text:
+        return "article"
+    return "unknown"
+
+
+def is_low_information_record(record: RefRecord) -> bool:
+    if record.raw_parse_quality == "failed":
+        return True
+    if not record.title_display_norm:
+        return True
+    if AUTHOR_LISTISH_RE.match(record.title_display_norm):
+        return True
+    if CONTAINER_ONLY_RE.match(record.title_display_norm):
+        return True
+    if len(record.work_title_tokens) < 3 and not (record.first_author_norm and record.year):
+        return True
+    return False
 
 
 def normalize_work_title(title: Optional[str]) -> tuple[str, list[str]]:
@@ -471,6 +560,9 @@ def title_noise_score(raw_title: str) -> int:
     penalty += 4 if DUPLICATED_PHRASE_RE.search(normalized) else 0
     penalty += 2 if OCR_HYPHEN_BREAK_RE.search(raw_title) else 0
     penalty += 5 if AUTHOR_LEAK_RE.search(raw_title) else 0
+    penalty += 7 if AUTHOR_LISTISH_RE.match(normalized) else 0
+    penalty += 6 if CONTAINER_ONLY_RE.match(normalized) else 0
+    penalty += 5 if SOURCE_META_RE.search(normalized) else 0
     penalty += 4 if LEADING_LABEL_RE.search(normalized) else 0
     penalty += 4 if re.search(r"\b(?:pp?\.?\s*\d+|vol\.?\s*\d+|issue\s*\d+)\b", normalized) else 0
     return penalty
@@ -479,16 +571,21 @@ def title_noise_score(raw_title: str) -> int:
 def choose_canonical(records: list[RefRecord]) -> RefRecord:
     """Choose the cleanest representative, not the longest string."""
 
-    def score(record: RefRecord) -> tuple[int, int, int, int, int, int, int, int]:
+    def score(record: RefRecord) -> tuple[int, int, int, int, int, int, int, int, int, int]:
         noise = title_noise_score(record.raw_title)
+        quality_pen = QUALITY_PENALTY.get(record.raw_parse_quality, 6)
+        type_pen = 8 if record.source_type_guess in {"proceedings", "editorial", "intro", "foreword", "preface", "commentary"} else 0
+        low_info_pen = 8 if record.low_information_flag else 0
         return (
             1 if record.year is not None and record.first_author_norm else 0,
             1 if record.doi_norm and not DOI_CONTAM_RE.search(record.raw_title) else 0,
             1 if record.title_display_norm and not LEADING_LABEL_RE.search(record.title_display_norm) else 0,
-            -noise,
+            -(noise + quality_pen + type_pen + low_info_pen),
+            1 if record.raw_source_title and not SOURCE_META_RE.search(record.raw_source_title) else 0,
             -len(record.work_title_tokens),
             -len(record.title_display_tokens),
             -len(record.title_tokens),
+            -1 if record.title_display_norm.islower() and len(record.title_display_norm.split()) > 5 else 0,
             len(record.raw_first_author or ""),
         )
 
@@ -513,17 +610,30 @@ def detect_source_rows(conn: sqlite3.Connection, refs_table: str) -> list[dict[s
     author_col = resolve_column(columns, ["first_author", "author", "ref_first_author", "parsed_first_author"], refs_table)
     year_col = resolve_column(columns, ["year", "ref_year", "parsed_year"], refs_table)
     doi_col = resolve_column(columns, ["doi", "ref_doi", "parsed_doi"], refs_table)
+    source_title_col = None
+    parse_quality_col = None
+    lowered = {column.lower(): column for column in columns}
+    for candidate in ["source_title", "container_title", "journal", "venue"]:
+        if candidate.lower() in lowered:
+            source_title_col = lowered[candidate.lower()]
+            break
+    for candidate in ["parse_quality", "quality", "parse_status"]:
+        if candidate.lower() in lowered:
+            parse_quality_col = lowered[candidate.lower()]
+            break
 
-    sql = f"""
-        SELECT
-            {quote_ident(ref_id_col)} AS source_ref_id,
-            {quote_ident(doc_id_col)} AS citing_doc_id,
-            {quote_ident(title_col)} AS raw_title,
-            {quote_ident(author_col)} AS raw_first_author,
-            {quote_ident(year_col)} AS raw_year,
-            {quote_ident(doi_col)} AS raw_doi
-        FROM {quote_ident(refs_table)}
-    """
+    select_parts = [
+        f"{quote_ident(ref_id_col)} AS source_ref_id",
+        f"{quote_ident(doc_id_col)} AS citing_doc_id",
+        f"{quote_ident(title_col)} AS raw_title",
+        f"{quote_ident(author_col)} AS raw_first_author",
+        f"{quote_ident(year_col)} AS raw_year",
+        f"{quote_ident(doi_col)} AS raw_doi",
+        f"{quote_ident(source_title_col)} AS raw_source_title" if source_title_col else "NULL AS raw_source_title",
+        f"{quote_ident(parse_quality_col)} AS raw_parse_quality" if parse_quality_col else "NULL AS raw_parse_quality",
+    ]
+
+    sql = f"SELECT {', '.join(select_parts)} FROM {quote_ident(refs_table)}"
     cursor = conn.execute(sql)
     names = [description[0] for description in cursor.description]
     return [dict(zip(names, row)) for row in cursor.fetchall()]
@@ -536,6 +646,8 @@ def build_ref_records(rows: list[dict[str, Any]]) -> list[RefRecord]:
         raw_title = str(row.get("raw_title") or "").strip()
         raw_first_author = str(row.get("raw_first_author") or "").strip()
         raw_doi = str(row.get("raw_doi") or "").strip()
+        raw_source_title = str(row.get("raw_source_title") or "").strip()
+        raw_parse_quality = str(row.get("raw_parse_quality") or "").strip().lower() or "low"
         year = safe_year(row.get("raw_year"))
 
         doi_norm = normalize_doi(raw_doi)
@@ -543,6 +655,8 @@ def build_ref_records(rows: list[dict[str, Any]]) -> list[RefRecord]:
         title_norm, title_tokens = normalize_title(raw_title)
         work_title_norm, work_title_tokens = normalize_work_title(raw_title)
         first_author_norm = normalize_author(raw_first_author)
+        source_title_norm = normalize_venue_equivalence(raw_source_title)
+        source_type_guess = guess_source_type(raw_title, raw_source_title)
         title_key8 = "_".join(title_tokens[:8]) if title_tokens else ""
         work_key8 = "_".join(work_title_tokens[:8]) if work_title_tokens else ""
 
@@ -562,6 +676,8 @@ def build_ref_records(rows: list[dict[str, Any]]) -> list[RefRecord]:
                 raw_first_author=raw_first_author,
                 raw_year=year,
                 raw_doi=raw_doi,
+                raw_source_title=raw_source_title,
+                raw_parse_quality=raw_parse_quality,
                 title_display_norm=title_display_norm,
                 title_display_tokens=title_display_tokens,
                 title_norm=title_norm,
@@ -575,8 +691,14 @@ def build_ref_records(rows: list[dict[str, Any]]) -> list[RefRecord]:
                 doi_norm=doi_norm,
                 exact_key=exact_key,
                 work_exact_key=work_exact_key,
+                source_title_norm=source_title_norm,
+                source_type_guess=source_type_guess,
+                low_information_flag=False,
             )
         )
+
+    for idx, record in enumerate(records):
+        records[idx].low_information_flag = is_low_information_record(record)
 
     return records
 
@@ -690,6 +812,17 @@ def apply_tier3_fuzzy(
 
                 similarity = float(fuzz.token_sort_ratio(rec_i.work_title_norm, rec_j.work_title_norm))
                 containment = is_containment_variant(rec_i, rec_j)
+                venue_equivalent = bool(
+                    rec_i.source_title_norm
+                    and rec_j.source_title_norm
+                    and rec_i.source_title_norm == rec_j.source_title_norm
+                )
+
+                if venue_equivalent and overlap >= 0.72 and similarity >= (auto_title_threshold - 4):
+                    if dsu.union(root_i, root_j):
+                        methods.setdefault(rec_i.source_ref_id, "venue_equivalent_fuzzy")
+                        methods.setdefault(rec_j.source_ref_id, "venue_equivalent_fuzzy")
+                    continue
 
                 if similarity >= auto_title_threshold or containment:
                     if dsu.union(root_i, root_j):
@@ -697,6 +830,8 @@ def apply_tier3_fuzzy(
                         methods.setdefault(rec_i.source_ref_id, method)
                         methods.setdefault(rec_j.source_ref_id, method)
                 elif review_title_min <= similarity < auto_title_threshold:
+                    if rec_i.low_information_flag or rec_j.low_information_flag:
+                        continue
                     if overlap >= 0.80 and similarity >= review_title_min + 2:
                         if dsu.union(root_i, root_j):
                             methods.setdefault(rec_i.source_ref_id, "high_overlap_fuzzy")
@@ -780,19 +915,32 @@ def materialize_clusters(
             counter += 1
 
     for root, members in clusters.items():
-        canonical = choose_canonical(members)
+        canonical_pool = [m for m in members if not m.low_information_flag and m.raw_parse_quality != "failed"]
+        canonical = choose_canonical(canonical_pool or members)
         seed = build_cluster_seed(canonical, root)
         cluster_id = make_unique_cluster_id(seed, root)
 
         confidence, cluster_method = cluster_confidence_for_members(members)
         member_ids = sorted(as_str_id(member.source_ref_id) for member in members)
 
+        canonical_author = canonical.raw_first_author or canonical.first_author_norm or None
+        canonical_year = canonical.year
+        canonical_title = canonical.title_display_norm or canonical.raw_title or canonical.title_norm or None
+
+        if not canonical_title:
+            for alt in sorted(members, key=lambda r: title_noise_score(r.raw_title)):
+                if alt.title_display_norm:
+                    canonical_title = alt.title_display_norm
+                    canonical_author = canonical_author or alt.raw_first_author or alt.first_author_norm or None
+                    canonical_year = canonical_year or alt.year
+                    break
+
         cluster_rows.append(
             (
                 cluster_id,
-                canonical.title_display_norm or canonical.raw_title or canonical.title_norm,
-                canonical.raw_first_author or canonical.first_author_norm,
-                canonical.year,
+                canonical_title,
+                canonical_author,
+                canonical_year,
                 None,
                 canonical.doi_norm or None,
                 confidence,
