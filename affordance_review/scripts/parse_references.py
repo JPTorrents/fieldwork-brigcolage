@@ -57,6 +57,7 @@ AUTHOR_TAIL_RE = re.compile(
     r",\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*(?:;\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*)+$"
 )
 URL_RE = re.compile(r"https?://\S+", re.I)
+AUTHOR_INITIALS_RE = re.compile(r"^[A-Z](?:\.[A-Z]){0,3}\.?$")
 AUTHOR_LISTISH_RE = re.compile(r"^(?:[a-z]+\s+[a-z](?:\.?\s+|\s+)){4,}[a-z]+$", re.I)
 CONTAINER_ONLY_RE = re.compile(
     r"^(?:in\s+)?(?:proceedings|journal|conference|symposium|workshop|handbook|annual\s+review)\b",
@@ -77,6 +78,22 @@ def parse_args() -> argparse.Namespace:
 
 def normalize_whitespace(text: str) -> str:
     return SPACE_RE.sub(" ", text).strip()
+
+
+def detect_year(text: str) -> bool:
+    return bool(PAREN_YEAR_RE.search(text) or YEAR_RE.search(text))
+
+
+def detect_doi(text: str) -> bool:
+    return bool(DOI_RE.search(text))
+
+
+def detect_url(text: str) -> bool:
+    return bool(URL_RE.search(text))
+
+
+def semicolon_count(text: str) -> int:
+    return text.count(";") if text else 0
 
 
 def text_norm(text: Optional[str]) -> Optional[str]:
@@ -170,6 +187,124 @@ def looks_like_author_block(text: str) -> bool:
         r"^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\-]+(?:\s+[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\-]+)*\s+[A-Z](?:\.[A-Z])?\.?(?:\s*;\s*[A-ZÀ-ÖØ-Ý].+)?$",
     ]
     return any(re.search(p, s) for p in patterns)
+
+
+def is_short_author_list_fragment(text: str) -> bool:
+    s = normalize_whitespace(text.strip(" ,;:."))
+    if not s or detect_year(s) or detect_doi(s) or detect_url(s):
+        return False
+    if ";" not in s:
+        return False
+    parts = [p.strip() for p in s.split(";") if p.strip()]
+    if not 2 <= len(parts) <= 8:
+        return False
+    return all(looks_like_author_block(p) or AUTHOR_INITIALS_RE.match(p.replace(" ", "")) for p in parts)
+
+
+def is_author_only_fragment(text: str) -> bool:
+    s = normalize_whitespace(text.strip(" ,;:."))
+    if not s or detect_year(s) or detect_doi(s) or detect_url(s):
+        return False
+    if is_short_author_list_fragment(s):
+        return True
+    if looks_like_author_block(s) and len(s) <= 80:
+        return True
+    return False
+
+
+def has_bibliographic_structure(text: str) -> bool:
+    s = normalize_whitespace(text)
+    if not s:
+        return False
+    if detect_year(s) or detect_doi(s) or detect_url(s):
+        return True
+    if len(s) >= 80 and "," in s and re.search(r"\b(pp?\.?|vol\.?|volume|issue|conference|journal|proceedings)\b", s, re.I):
+        return True
+    return False
+
+
+def likely_valid_reference(text: str) -> bool:
+    s = normalize_whitespace(text)
+    if not s:
+        return False
+    if is_author_only_fragment(s):
+        return False
+    return has_bibliographic_structure(s)
+
+
+def classify_segment(segment: str) -> tuple[str, str]:
+    s = normalize_whitespace(segment)
+    if not s:
+        return "fragment", "empty"
+    if is_author_only_fragment(s):
+        return "fragment", "author_only_fragment"
+    if len(s) < 25 and not (detect_year(s) or detect_doi(s) or detect_url(s)):
+        return "fragment", "short_low_structure"
+    if likely_valid_reference(s):
+        if semicolon_count(s) >= 2 and not detect_year(s):
+            return "needs_review", "semicolon_heavy_no_year"
+        return "clean", "strong_anchor"
+    if len(s) >= 50 and "," in s:
+        return "needs_review", "weak_structure"
+    return "fragment", "insufficient_structure"
+
+
+def retain_reference(segment: str) -> bool:
+    quality, _ = classify_segment(segment)
+    return quality != "fragment"
+
+
+def segment_reference_blob(blob: Optional[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Conservative segmentation of Scopus semicolon-delimited reference blobs."""
+    text = normalize_whitespace(blob or "")
+    if not text:
+        return [], []
+
+    fragments = [normalize_whitespace(part) for part in text.split(";") if normalize_whitespace(part)]
+    if not fragments:
+        return [], []
+
+    merged: list[str] = []
+    current = fragments[0]
+    for nxt in fragments[1:]:
+        curr_quality, _ = classify_segment(current)
+        next_quality, _ = classify_segment(nxt)
+        if curr_quality == "clean" and (next_quality == "clean" or detect_year(nxt) or detect_doi(nxt) or detect_url(nxt)):
+            merged.append(current)
+            current = nxt
+            continue
+        if next_quality == "fragment" and len(nxt) < 90:
+            current = f"{current}; {nxt}"
+            continue
+        if curr_quality == "fragment" and next_quality != "fragment":
+            current = f"{current}; {nxt}"
+            continue
+        if detect_year(current) and (detect_year(nxt) or detect_doi(nxt) or detect_url(nxt)):
+            merged.append(current)
+            current = nxt
+            continue
+        current = f"{current}; {nxt}"
+    merged.append(current)
+
+    retained: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for seg in merged:
+        quality, reason = classify_segment(seg)
+        payload = {
+            "raw": seg,
+            "raw_len": len(seg),
+            "has_year": int(detect_year(seg)),
+            "has_doi": int(detect_doi(seg)),
+            "has_url": int(detect_url(seg)),
+            "semicolon_count": semicolon_count(seg),
+            "reason": reason,
+            "quality": quality,
+        }
+        if quality == "fragment":
+            rejected.append(payload)
+        else:
+            retained.append(payload)
+    return retained, rejected
 
 
 def is_probable_fragment(raw: str) -> bool:
@@ -542,6 +677,7 @@ def fetch_raw_references(conn: sqlite3.Connection) -> list[tuple[int, int, int, 
         """
         SELECT raw_ref_id, doc_id, ref_order, raw_reference
         FROM references_raw
+        WHERE segmentation_quality != 'fragment'
         ORDER BY doc_id, ref_order
         """
     ).fetchall()

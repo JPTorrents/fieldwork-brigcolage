@@ -6,10 +6,11 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 from unidecode import unidecode
+
+from parse_references import segment_reference_blob
 
 
 CSV_PATH = Path("data/raw/scopus_affordance_2010_2026.csv")
@@ -23,26 +24,6 @@ REQUIRED_TABLES = {
     "keywords",
     "document_keywords",
     "references_raw",
-}
-
-DOCUMENT_COLUMN_MAP = {
-    "EID": "eid",
-    "Title": "title",
-    "Year": "year",
-    "Source title": "source_title",
-    "Volume": "volume",
-    "Issue": "issue",
-    "Art. No.": "article_no",
-    "Page start": "page_start",
-    "Page end": "page_end",
-    "Cited by": "cited_by",
-    "DOI": "doi",
-    "Link": "link",
-    "Abstract": "abstract",
-    "Document Type": "document_type",
-    "Publication Stage": "publication_stage",
-    "Open Access": "open_access",
-    "Source": "source_db",
 }
 
 REQUIRED_CSV_COLUMNS = ["EID", "Title", "Year"]
@@ -127,284 +108,6 @@ def split_semicolon_field(value) -> list[str]:
     return [part for part in parts if part]
 
 
-###
-### START REF SPLITTING BLOCK
-###
-
-YEAR_END_RE = re.compile(r"^(.*?\((19\d{2}|20\d{2})\))(?:;\s+)(.+)$")
-YEAR_END_BARE_RE = re.compile(r"^(.*?\b(19\d{2}|20\d{2})\b)(?:;\s+)(.+)$")
-
-AUTHOR_ONLY_RE = re.compile(
-    r"^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\-]+(?:\s+[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\-]+)*"
-    r"(?:\s+[A-Z](?:\.[A-Z]){0,3}\.?|,\s*[A-Z](?:\.[A-Z]){0,3}\.?)$"
-)
-
-AUTHOR_START_RE = re.compile(
-    r"^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\-]+(?:\s+[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\-]+)*"
-    r"(?:\s+[A-Z](?:\.[A-Z]){0,3}\.?|,\s*[A-Z](?:\.[A-Z]){0,3}\.?)"
-)
-
-DOI_RE = re.compile(r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", re.I)
-PAGES_RE = re.compile(r"\bpp?\.\s*[A-Za-z0-9]+(?:\s*[-–—]\s*[A-Za-z0-9]+)?", re.I)
-YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2}|17\d{2}|18\d{2})(?!\d)")
-PAREN_YEAR_RE = re.compile(r"\((17\d{2}|18\d{2}|19\d{2}|20\d{2})\)")
-YEAR_SEMI_SPLIT_RE = re.compile(r"^(.*?\((17\d{2}|18\d{2}|19\d{2}|20\d{2})\)|.*?\b(17\d{2}|18\d{2}|19\d{2}|20\d{2})\b);\s+(.+)$")
-
-def normalize_ws(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-def extract_years(text: str) -> list[int]:
-    years = []
-    for y in YEAR_RE.findall(text):
-        try:
-            years.append(int(y))
-        except ValueError:
-            pass
-    return years
-
-def count_years(text: str) -> int:
-    return len(extract_years(text))
-
-def has_year(text: str) -> bool:
-    return bool(PAREN_YEAR_RE.search(text) or YEAR_RE.search(text))
-
-
-def has_doi(text: str) -> bool:
-    return bool(DOI_RE.search(text))
-
-
-def has_pages(text: str) -> bool:
-    return bool(PAGES_RE.search(text))
-
-
-def looks_like_author_only_fragment(text: str) -> bool:
-    s = normalize_ws(text.strip(" ,"))
-    if not s:
-        return False
-    if has_year(s) or has_doi(s) or has_pages(s):
-        return False
-    return bool(AUTHOR_ONLY_RE.match(s))
-
-
-def looks_like_reference_candidate(text: str) -> bool:
-    s = normalize_ws(text.strip(" ,"))
-    if not s:
-        return False
-    if not AUTHOR_START_RE.match(s):
-        return False
-    if has_year(s) or has_doi(s) or has_pages(s):
-        return True
-    if "," in s:
-        left, right = s.split(",", 1)
-        if len(right.strip()) >= 12:
-            return True
-    return False
-
-def ends_with_year(text: str) -> bool:
-    s = normalize_ws(text).rstrip(" .,;:")
-    return bool(re.search(r"(\((19\d{2}|20\d{2})\)|(19\d{2}|20\d{2}))$", s))
-
-def find_year_boundary_split(ref: str, max_lookahead_parts: int = 4) -> Optional[tuple[str, str]]:
-    """
-    Detect merged pattern:
-    <complete citation ending in year>; <start of next citation ...>
-
-    Return (left_ref, right_ref) if a plausible split is found.
-    """
-    s = normalize_ws(ref)
-
-    for rx in (YEAR_END_RE, YEAR_END_BARE_RE):
-        m = rx.match(s)
-        if not m:
-            continue
-
-        left = m.group(1).strip(" ,;")
-        suffix = m.group(3).strip(" ,;")
-
-        parts = [normalize_ws(p) for p in suffix.split(";") if normalize_ws(p)]
-        if not parts:
-            continue
-
-        candidate = parts[0]
-        if looks_like_reference_candidate(candidate):
-            return left, candidate
-
-        for j in range(1, min(len(parts), max_lookahead_parts)):
-            candidate = f"{candidate}; {parts[j]}"
-            if looks_like_reference_candidate(candidate):
-                remainder = "; ".join(parts[:j+1]).strip(" ,;")
-                tail = "; ".join(parts[j+1:]).strip(" ,;")
-                right = remainder if not tail else f"{remainder}; {tail}"
-                return left, right
-
-    return None
-
-def lookahead_candidate(parts: list[str], start_idx: int, max_parts: int = 4) -> Optional[str]:
-    """
-    Assemble up to max_parts semicolon fragments starting at start_idx.
-    Return the shortest plausible citation candidate, else None.
-    """
-    candidate = parts[start_idx]
-    if looks_like_reference_candidate(candidate):
-        return candidate
-
-    for j in range(start_idx + 1, min(len(parts), start_idx + max_parts)):
-        candidate = f"{candidate}; {parts[j]}"
-        if looks_like_reference_candidate(candidate):
-            return candidate
-
-    return None
-
-def current_chunk_is_complete(text: str) -> bool:
-    s = normalize_ws(text)
-    if not s:
-        return False
-
-    if has_doi(s) or has_pages(s):
-        return True
-
-    if ends_with_year(s):
-        return True
-
-    if has_year(s) and "," in s:
-        left, right = s.split(",", 1)
-        if right.strip():
-            return True
-
-    return False
-
-def should_start_new_reference(current: str, parts: list[str], idx: int) -> bool:
-    """
-    Start a new reference only with positive evidence.
-
-    Key rule:
-    If current chunk already ends as a complete citation, especially at a year boundary,
-    and the next few fragments can be assembled into a plausible new citation,
-    then split.
-    """
-    if idx >= len(parts):
-        return False
-
-    current = normalize_ws(current)
-    next_frag = normalize_ws(parts[idx])
-
-    if not next_frag:
-        return False
-
-    if not current_chunk_is_complete(current):
-        return False
-
-    candidate = lookahead_candidate(parts, idx, max_parts=4)
-    if not candidate:
-        return False
-
-    # Strongest case: current citation ends with year and the next sequence forms a citation
-    if ends_with_year(current):
-        return True
-
-    # Also allow split if next fragment is itself already a strong reference start
-    if looks_like_reference_candidate(next_frag):
-        return True
-
-    return False
-
-def split_references_conservative(value) -> list[str]:
-    """
-    Reference splitter for Scopus exports.
-
-    Principles:
-    - start from naive semicolon split
-    - preserve semicolons inside author lists
-    - split after completed citations when a lookahead sequence forms a plausible new citation
-    """
-    text = text_or_none(value)
-    if not text:
-        return []
-
-    parts = [normalize_ws(part) for part in text.split(";")]
-    parts = [part for part in parts if part]
-
-    if not parts:
-        return []
-
-    refs: list[str] = []
-    current = parts[0]
-    i = 1
-
-    while i < len(parts):
-        if should_start_new_reference(current, parts, i):
-            refs.append(current.strip(" ,;"))
-            current = parts[i]
-        else:
-            current = f"{current}; {parts[i]}"
-        i += 1
-
-    refs.append(current.strip(" ,;"))
-    return [r for r in refs if r]
-
-
-def split_at_first_terminal_year_semicolon(text: str) -> Optional[tuple[str, str]]:
-    """
-    Split:
-    <left citation ending in year> ; <right remainder>
-    """
-    s = normalize_ws(text)
-    m = YEAR_SEMI_SPLIT_RE.match(s)
-    if not m:
-        return None
-
-    left = m.group(1).strip(" ,;")
-    right = m.group(4).strip(" ,;")
-
-    if not left or not right:
-        return None
-
-    return left, right
-
-def recursively_split_multi_year_reference(ref: str, max_rounds: int = 8) -> list[str]:
-    """
-    If one raw string contains multiple year markers, repeatedly split after the
-    earliest terminal year followed by semicolon.
-    """
-    pending = [normalize_ws(ref)]
-    out = []
-
-    rounds = 0
-    while pending and rounds < max_rounds:
-        current = pending.pop(0)
-
-        # Only attempt demerge when multiple years exist
-        if count_years(current) <= 1:
-            out.append(current)
-            rounds += 1
-            continue
-
-        split_result = split_at_first_terminal_year_semicolon(current)
-        if split_result is None:
-            out.append(current)
-            rounds += 1
-            continue
-
-        left, right = split_result
-        out.append(left)
-        pending.insert(0, right)
-        rounds += 1
-
-    out.extend(pending)
-    return [x.strip(" ,;") for x in out if x.strip(" ,;")]
-
-
-def split_references_final(value) -> list[str]:
-    first_pass = split_references_conservative(value)
-    final_refs = []
-    for ref in first_pass:
-        final_refs.extend(recursively_split_multi_year_reference(ref))
-    return final_refs
-
-###
-### END REF SPLITTING BLOCK
-###
-
 
 
 def assert_db_ready(conn: sqlite3.Connection) -> None:
@@ -444,6 +147,8 @@ def clear_ingest_tables(conn: sqlite3.Connection) -> None:
     try:
         for table in [
             "document_reference_links",
+            "reference_fragments_rejected",
+            "cited_references",
             "references_raw",
             "document_keywords",
             "keywords",
@@ -459,59 +164,57 @@ def clear_ingest_tables(conn: sqlite3.Connection) -> None:
 
 
 def ingest_documents(conn: sqlite3.Connection, df: pd.DataFrame) -> dict[str, int]:
-    insert_sql = """
-    INSERT INTO documents (
-        eid, title, year, source_title, volume, issue, article_no, page_start,
-        page_end, cited_by, doi, link, abstract, document_type,
-        publication_stage, open_access, source_db
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
+    # Align loader with active DB schema instead of hard-coding retired columns.
+    column_map = {
+        "eid": text_or_none,
+        "title": text_or_none,
+        "year": int_or_none,
+        "source_title": text_or_none,
+        "volume": text_or_none,
+        "cited_by": int_or_none,
+        "doi": normalize_doi,
+        "link": text_or_none,
+        "abstract": text_or_none,
+        "document_type": text_or_none,
+        "source_db": text_or_none,
+    }
+    csv_map = {
+        "eid": "EID",
+        "title": "Title",
+        "year": "Year",
+        "source_title": "Source title",
+        "volume": "Volume",
+        "cited_by": "Cited by",
+        "doi": "DOI",
+        "link": "Link",
+        "abstract": "Abstract",
+        "document_type": "Document Type",
+        "source_db": "Source",
+    }
+
+    available_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()
+    }
+    insert_cols = [c for c in csv_map if c in available_cols]
+    if "eid" not in insert_cols:
+        raise RuntimeError("documents table missing required column: eid")
+
+    placeholders = ", ".join(["?"] * len(insert_cols))
+    cols_sql = ", ".join(insert_cols)
+    insert_sql = f"INSERT INTO documents ({cols_sql}) VALUES ({placeholders})"
 
     count = 0
     for _, row in df.iterrows():
-        record = {
-            "eid": text_or_none(row.get("EID")),
-            "title": text_or_none(row.get("Title")),
-            "year": int_or_none(row.get("Year")),
-            "source_title": text_or_none(row.get("Source title")),
-            "volume": text_or_none(row.get("Volume")),
-            "issue": text_or_none(row.get("Issue")),
-            "article_no": text_or_none(row.get("Art. No.")),
-            "page_start": text_or_none(row.get("Page start")),
-            "page_end": text_or_none(row.get("Page end")),
-            "cited_by": int_or_none(row.get("Cited by")),
-            "doi": normalize_doi(row.get("DOI")),
-            "link": text_or_none(row.get("Link")),
-            "abstract": text_or_none(row.get("Abstract")),
-            "document_type": text_or_none(row.get("Document Type")),
-            "publication_stage": text_or_none(row.get("Publication Stage")),
-            "open_access": text_or_none(row.get("Open Access")),
-            "source_db": text_or_none(row.get("Source")),
-        }
-        if not record["eid"]:
+        eid = text_or_none(row.get("EID"))
+        if not eid:
             continue
-        conn.execute(
-            insert_sql,
-            (
-                record["eid"],
-                record["title"],
-                record["year"],
-                record["source_title"],
-                record["volume"],
-                record["issue"],
-                record["article_no"],
-                record["page_start"],
-                record["page_end"],
-                record["cited_by"],
-                record["doi"],
-                record["link"],
-                record["abstract"],
-                record["document_type"],
-                record["publication_stage"],
-                record["open_access"],
-                record["source_db"],
-            ),
-        )
+
+        record = []
+        for col in insert_cols:
+            value = row.get(csv_map[col])
+            record.append(column_map[col](value))
+
+        conn.execute(insert_sql, tuple(record))
         count += 1
 
     doc_map = {
@@ -619,10 +322,7 @@ def ingest_keywords(conn: sqlite3.Connection, df: pd.DataFrame, doc_map: dict[st
     keyword_rows = 0
     bridge_rows = 0
 
-    field_specs = [
-        ("Author Keywords", "author"),
-        ("Index Keywords", "index"),
-    ]
+    field_specs = [("Author Keywords", "author")]
 
     for _, row in df.iterrows():
         eid = text_or_none(row.get("EID"))
@@ -679,7 +379,7 @@ def ingest_keywords(conn: sqlite3.Connection, df: pd.DataFrame, doc_map: dict[st
 def ingest_references_raw(conn: sqlite3.Connection, df: pd.DataFrame, doc_map: dict[str, int]) -> dict[str, int]:
     docs_with_refs = 0
     raw_ref_rows = 0
-    suspicious_short_refs = 0
+    rejected_rows = 0
 
     for _, row in df.iterrows():
         eid = text_or_none(row.get("EID"))
@@ -687,28 +387,81 @@ def ingest_references_raw(conn: sqlite3.Connection, df: pd.DataFrame, doc_map: d
             continue
         doc_id = doc_map[eid]
 
-        raw_refs = split_references_final(row.get("References"))
-        if not raw_refs:
+        retained, rejected = segment_reference_blob(text_or_none(row.get("References")))
+        if not retained and not rejected:
             continue
 
         docs_with_refs += 1
-        for ref_order, raw_reference in enumerate(raw_refs, start=1):
-            if len(raw_reference) < 40 and not has_year(raw_reference):
-                suspicious_short_refs += 1
-
+        ref_order = 1
+        for segment in retained:
             conn.execute(
                 """
-                INSERT INTO references_raw (doc_id, ref_order, raw_reference)
-                VALUES (?, ?, ?)
+                INSERT INTO references_raw (
+                    doc_id,
+                    ref_order,
+                    raw_reference,
+                    raw_reference_len,
+                    has_year,
+                    has_doi,
+                    has_url,
+                    semicolon_count,
+                    segmentation_quality,
+                    segmentation_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (doc_id, ref_order, raw_reference),
+                (
+                    doc_id,
+                    ref_order,
+                    segment["raw"],
+                    segment["raw_len"],
+                    segment["has_year"],
+                    segment["has_doi"],
+                    segment["has_url"],
+                    segment["semicolon_count"],
+                    segment["quality"],
+                    segment["reason"],
+                ),
             )
             raw_ref_rows += 1
+            ref_order += 1
+
+        # Persist obvious fragments for traceability instead of dropping silently.
+        parent_context = text_or_none(row.get("References"))
+        for frag in rejected:
+            conn.execute(
+                """
+                INSERT INTO reference_fragments_rejected (
+                    doc_id,
+                    ref_order,
+                    raw_fragment,
+                    raw_fragment_len,
+                    has_year,
+                    has_doi,
+                    has_url,
+                    semicolon_count,
+                    rejection_reason,
+                    parent_context
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    doc_id,
+                    None,
+                    frag["raw"],
+                    frag["raw_len"],
+                    frag["has_year"],
+                    frag["has_doi"],
+                    frag["has_url"],
+                    frag["semicolon_count"],
+                    frag["reason"],
+                    parent_context,
+                ),
+            )
+            rejected_rows += 1
 
     return {
         "docs_with_references": docs_with_refs,
         "references_raw_inserted": raw_ref_rows,
-        "suspicious_short_refs": suspicious_short_refs,
+        "fragments_rejected": rejected_rows,
     }
 
 
@@ -751,7 +504,7 @@ def main() -> int:
         print(f"Document-keyword links inserted: {keyword_stats['document_keywords_inserted']}")
         print(f"Documents with references: {ref_stats['docs_with_references']}")
         print(f"Raw references inserted: {ref_stats['references_raw_inserted']}")
-        print(f"Suspicious short raw refs: {ref_stats['suspicious_short_refs']}")
+        print(f"Rejected reference fragments: {ref_stats['fragments_rejected']}")
         print(f"Database populated: {args.db}")
 
     finally:
