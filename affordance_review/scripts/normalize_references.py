@@ -52,8 +52,48 @@ WS_REGEX = re.compile(r"\s+")
 
 BRACKET_LABEL_RE = re.compile(r"\[(?:[A-Za-z]{1,3}|\d+\s*paragraphs?)\]")
 EDITION_RE = re.compile(
-    r"\b(?:\d{1,2}(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+ed(?:ition)?\b",
-    re.I,
+    r"""
+    (?:
+        # ordinal/numeric edition markers
+        \b(?:\d{1,2}(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)
+        \s+
+        ed(?:ition)?\b
+        |
+        # named edition descriptors
+        \bclassic\s+edition\b
+        |
+        \brevised(?:\s+and\s+expanded)?\s+edition\b
+        |
+        \bexpanded\s+edition\b
+        |
+        \bupdated\s+edition\b
+        |
+        \bnew\s+edition\b
+        |
+        \banniversary\s+edition\b
+        |
+        # seasonal/yearly encyclopedia-style edition labels
+        \b(?:spring|summer|fall|autumn|winter)\s+\d{4}\s+edition\b
+    )
+    """,
+    re.I | re.X,
+)
+TRAILING_EDITION_RE = re.compile(
+    r"""
+    (?:[\s:;,\-\(\[]+)
+    (?:
+        (?:\d{1,2}(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+ed(?:ition)?|
+        classic\s+edition|
+        revised(?:\s+and\s+expanded)?\s+edition|
+        expanded\s+edition|
+        updated\s+edition|
+        new\s+edition|
+        anniversary\s+edition|
+        (?:spring|summer|fall|autumn|winter)\s+\d{4}\s+edition
+    )
+    (?:[\s\)\].,;:]*)$
+    """,
+    re.I | re.X,
 )
 VOLUME_MARKER_RE = re.compile(r"\b(?:vol\.?|volume)\s*\d+\b", re.I)
 PAGE_DEBRIS_RE = re.compile(r"\bpp?\.?\s*[A-Za-z]?\d+[A-Za-z]?(?:\s*[-–—]\s*[A-Za-z]?\d+[A-Za-z]?)?\b", re.I)
@@ -63,8 +103,73 @@ PROCEEDINGS_RE = re.compile(
     re.I,
 )
 VENUE_TAIL_RE = re.compile(
-    r"\b(?:journal\s+of|transactions\s+on|interact\.?\s*comput\.?\b|interacting\s+with\s+computers\b|psychol\.?\s*bull\.?\b|acad\.?\s*med\.?\b|organ\.?\s*sci\.?\b|ecol\.?\s*psychol\.?\b|mis\s*q\b|acad\.?\s*manag\.?\s*rev\.?\b|chi\s*['’]?\d{2}|hicss\b|acm\b)\b",
-    re.I,
+    r"""
+    \b(
+        journal\s+of|
+        transactions\s+on|
+        proceedings\b|
+        interact\.?\s*comput\.?|
+        interacting\s+with\s+computers|
+        psychol\.?\s*bull\.?|
+        psychol\.?\s*rev\.?|
+        acad\.?\s*med\.?|
+        acad\.?\s*manag\.?\s*j\.?|
+        acad\.?\s*manag\.?\s*rev\.?|
+        organ\.?\s*sci\.?|
+        ecol\.?\s*psychol\.?|
+        mis\s*q\.?|
+        inf\.?\s*syst\.?\s*res\.?|
+        inform\.?\s*syst\.?\s*res\.?|
+        inf\.?\s*syst\.?\s*j\.?|
+        j\.?\s*strateg\.?\s*inf\.?\s*syst\.?|
+        eur\.?\s*j\.?\s*inf\.?\s*syst\.?|
+        ind\.?\s*manag\.?\s*data\s*syst\.?|
+        prod\.?\s*oper\.?\s*manag\.?|
+        acad\.?\s*manag\.?\s*j\.?|
+        bus\.?\s*inf\.?\s*syst\.?\s*eng\.?|
+        ieee\s*trans\.?\s*eng\.?\s*manag\.?|
+        j\.?\s*supply\s+chain\s+manag\.?|
+        proj\.?\s*manag\.?\s*j\.?|
+        technol\.?\s*innov\.?\s*manag\.?\s*rev\.?|
+        annu\.?\s*rev\.?\s*psychol\.?|
+        commun\.?\s*monogr\.?|
+        motiv\.?\s*emot\.?|
+        med\.?\s*educ\.?|
+        comput\.?\s*educ\.?|
+        calif\.?\s*manag\.?\s*rev\.?|
+        lang\.?\s*sci\.?|
+        hum\.?\s*comput\.?\s*interact\.?|
+        perspect\.?\s*psychol\.?\s*sci\.?|
+        behav\.?\s*inf\.?\s*technol\.?|
+        chi\s*['’]?\d{2}|
+        hicss\b|
+        acm\b
+    )\b
+    """,
+    re.I | re.X,
+)
+TRAILING_VENUE_NUMERIC_RE = re.compile(
+    r"""
+    (?:[,;:\s]+)
+    (?:
+        prod\.?\s*oper\.?\s*manag\.?|
+        inf\.?\s*syst\.?\s*res\.?|
+        inform\.?\s*syst\.?\s*res\.?|
+        inf\.?\s*syst\.?\s*j\.?|
+        j\.?\s*strateg\.?\s*inf\.?\s*syst\.?|
+        acad\.?\s*manag\.?\s*j\.?|
+        organ\.?\s*sci\.?|
+        ieee\s*trans\.?\s*eng\.?\s*manag\.?|
+        ind\.?\s*manag\.?\s*data\s*syst\.?|
+        bus\.?\s*inf\.?\s*syst\.?\s*eng\.?|
+        proj\.?\s*manag\.?\s*j\.?|
+        eur\.?\s*j\.?\s*inf\.?\s*syst\.?|
+        technol\.?\s*innov\.?\s*manag\.?\s*rev\.?|
+        j\.?\s*supply\s+chain\s+manag\.?
+    )
+    (?:[,;:\s]+(?:\(?\d{1,4}\)?|[a-z]\d+[a-z]?))*\s*$
+    """,
+    re.I | re.X,
 )
 TRAILING_SOURCE_FRAGMENT_RE = re.compile(r"(?:[,;:]\s*)?(international|information|european|practice|work)\s*$", re.I)
 DOI_CONTAM_RE = re.compile(r"\bdoi\b|doi\.org|10\.\d{4,9}/", re.I)
@@ -118,45 +223,70 @@ UK_US_MAP = {
     "catalogue": "catalog",
 }
 
-
 VENUE_ABBREV_MAP = {
-    "interactive learning environments": "interactive learning environments",
-    "interact learn environ": "interactive learning environments",
-    "qualitative inquiry": "qualitative inquiry",
-    "qual inq": "qualitative inquiry",
-    "management science": "management science",
-    "manage sci": "management science",
-    "information management": "information management",
-    "inform manag": "information management",
-    "information systems research": "information systems research",
-    "inf syst res": "information systems research",
-    "cognitive science": "cognitive science",
-    "cogn sci": "cognitive science",
-    "emotion review": "emotion review",
-    "emot rev": "emotion review",
-    "harvard business review": "harvard business review",
-    "harv bus rev": "harvard business review",
-    "strategic management journal": "strategic management journal",
-    "strateg manag j": "strategic management journal",
-    "organization studies": "organization studies",
-    "organ stud": "organization studies",
-    "teaching in higher education": "teaching in higher education",
-    "teach high educ": "teaching in higher education",
-    "body society": "body society",
-    "body soc": "body society",
-    "annual review of sociology": "annual review of sociology",
-    "annu rev sociol": "annual review of sociology",
-    "assessment evaluation in higher education": "assessment evaluation in higher education",
-    "assess eval high educ": "assessment evaluation in higher education",
-    "academy of management journal": "academy of management journal",
-    "acad manag j": "academy of management journal",
-    "psychol bull": "psychological bulletin",
-    "acad med": "academic medicine",
-    "organ sci": "organization science",
-    "ecol psychol": "ecological psychology",
-    "interact comput": "interacting with computers",
-}
+    "res lang soc interact": "research on language and social interaction",
+    "research on language and social interaction": "research on language and social interaction",
 
+    "comput educ": "computers and education",
+    "computers and education": "computers and education",
+
+    "theor cult soc": "theory culture and society",
+    "theory culture society": "theory culture and society",
+    "theory culture and society": "theory culture and society",
+
+    "med educ": "medical education",
+    "medical education": "medical education",
+
+    "inf syst res": "information systems research",
+    "inform syst res": "information systems research",
+    "information systems research": "information systems research",
+
+    "calif manag rev": "california management review",
+    "california management review": "california management review",
+
+    "lang sci": "language sciences",
+    "language sciences": "language sciences",
+
+    "soc": "sociology",
+    "sociology": "sociology",
+
+    "ind manag data syst": "industrial management and data systems",
+    "industrial management and data systems": "industrial management and data systems",
+
+    "motiv emot": "motivation and emotion",
+    "motivation and emotion": "motivation and emotion",
+
+    "acad manag j": "academy of management journal",
+    "acad manage j": "academy of management journal",
+    "academy of management journal": "academy of management journal",
+
+    "commun monogr": "communications monographs",
+    "communications monographs": "communications monographs",
+
+    "educ inf": "education for information",
+    "efi": "education for information",
+    "education for information": "education for information",
+
+    "annu rev psychol": "annual review of psychology",
+    "annual review of psychology": "annual review of psychology",
+
+    "perspect psychol sci": "perspectives on psychological science",
+    "perspectives on psychological science": "perspectives on psychological science",
+
+    "behav inf technol": "behavior and information technology",
+    "behaviour information technology": "behavior and information technology",
+    "behaviour and information technology": "behavior and information technology",
+    "behavior and information technology": "behavior and information technology",
+
+    "hum comput interact": "human computer interaction",
+    "human computer interaction": "human computer interaction",
+
+    "psychol rev": "psychological review",
+    "psychological review": "psychological review",
+
+    "cyberpsychol behav soc netw": "cyberpsychology behavior and social networking",
+    "cyberpsychology behavior and social networking": "cyberpsychology behavior and social networking",
+}
 
 @dataclass
 class RefRecord:
@@ -225,15 +355,23 @@ def normalize_text(text: Optional[str]) -> str:
 
 
 def normalize_display_title(title: Optional[str]) -> tuple[str, list[str]]:
-    text = normalize_text(title)
-    if not text:
+    if not title:
         return "", []
+
+    text = unidecode(str(title)).lower()
+    if not text.strip():
+        return "", []
+
     text = strip_doi_fragments(text)
-    text = AUTHOR_LEAK_RE.sub("", text).strip(" ,;:")
+    text = URL_RE.sub(" ", text)
+    text = AUTHOR_LEAK_RE.sub("", text)
     text = LEADING_LABEL_RE.sub("", text).strip(" ,;:")
     text = TITLE_LABEL_TAIL_RE.sub(" ", text)
     text = TRAILING_SOURCE_FRAGMENT_RE.sub("", text)
+
+    text = PUNCT_REGEX.sub(" ", text)
     text = WS_REGEX.sub(" ", text).strip()
+
     tokens = [tok for tok in text.split() if tok]
     return " ".join(tokens), tokens
 
@@ -254,31 +392,63 @@ def strip_doi_fragments(text: str) -> str:
 
 
 def strip_source_tail(text: str) -> str:
-    """Remove source/container tails with strong metadata evidence."""
-    cleaned = normalize_text(text)
+    """Remove source/container tails with strong metadata evidence.
+
+    Important: preserve comma/semicolon structure before segmentation.
+    """
+    if not text:
+        return ""
+
+    # Light normalization only: lowercase + ascii fold, but keep punctuation
+    cleaned = unidecode(str(text)).lower().strip()
     if not cleaned:
         return ""
 
-    parts = [p.strip() for p in re.split(r"\s*[,;]\s*", cleaned) if p.strip()]
+    # Normalize whitespace but preserve commas/semicolons/parentheses for segmentation
+    cleaned = WS_REGEX.sub(" ", cleaned)
+
+    parts = [p.strip(" ,;:") for p in re.split(r"\s*[,;]\s*", cleaned) if p.strip(" ,;:")]
     if len(parts) <= 1:
-        return TRAILING_SOURCE_FRAGMENT_RE.sub("", cleaned).strip(" ,;:")
+        candidate = cleaned.strip(" ,;:")
+        candidate = TRAILING_SOURCE_FRAGMENT_RE.sub("", candidate).strip(" ,;:")
+        candidate = PUNCT_REGEX.sub(" ", candidate)
+        return WS_REGEX.sub(" ", candidate).strip()
 
     kept: list[str] = []
     for idx, part in enumerate(parts):
-        if idx > 0 and (PROCEEDINGS_RE.search(part) or VENUE_TAIL_RE.search(part)):
+        if idx == 0:
+            kept.append(part)
+            continue
+
+        venue_norm = normalize_venue_equivalence(part)
+        has_venue_signal = bool(
+            PROCEEDINGS_RE.search(part)
+            or VENUE_TAIL_RE.search(part)
+            or venue_norm != normalize_text(part)
+        )
+        has_meta_signal = bool(
+            re.search(r"\b(?:vol\.?|volume|pp?\.?|issue)\b", part, re.I)
+            or ISSUE_DEBRIS_RE.search(part)
+            or PAGE_DEBRIS_RE.search(part)
+            or re.fullmatch(r"\(?\d{1,4}\)?", part)
+        )
+        has_author_leak = bool(
+            AUTHOR_LEAK_RE.search(part)
+            or re.search(r"(?:^|;\s*)[a-z][a-z'\-]+\s+[a-z](?:\.[a-z])?\.?(?:\s*;\s*[a-z][a-z'\-]+\s+[a-z](?:\.[a-z])?\.?)*$", part, re.I)
+        )
+
+        if has_venue_signal or has_meta_signal or has_author_leak:
             break
-        if idx > 0 and re.search(r"\b(?:vol\.?|volume|pp?\.?)\b", part, re.I):
+
+        if TRAILING_SOURCE_FRAGMENT_RE.fullmatch(part):
             break
-        if idx > 0 and ISSUE_DEBRIS_RE.search(part):
-            break
-        if idx > 0 and TRAILING_SOURCE_FRAGMENT_RE.fullmatch(part):
-            break
+
         kept.append(part)
 
     candidate = ", ".join(kept) if kept else parts[0]
     candidate = TRAILING_SOURCE_FRAGMENT_RE.sub("", candidate).strip(" ,;:")
-    return candidate
-
+    candidate = PUNCT_REGEX.sub(" ", candidate)
+    return WS_REGEX.sub(" ", candidate).strip()
 
 def repair_ocr_breaks(text: str) -> str:
     """Repair OCR-only splits conservatively; never join arbitrary compounds."""
@@ -307,19 +477,17 @@ def normalize_spelling_for_match(text: str) -> str:
     mapped = [UK_US_MAP.get(token, token) for token in tokens]
     return " ".join(mapped)
 
-
 def normalize_venue_equivalence(text: str) -> str:
     """Collapse routine journal abbreviation/full-form variants for matching only."""
     normalized = normalize_text(text)
     if not normalized:
         return ""
-    normalized = re.sub(r"\b([a-z]{3,})\.\b", r"\1", normalized)
+
     normalized = normalized.replace("&", " and ")
     normalized = WS_REGEX.sub(" ", normalized).strip()
-    for short, long_form in VENUE_ABBREV_MAP.items():
-        normalized = re.sub(rf"\b{re.escape(short)}\b", long_form, normalized)
-    return WS_REGEX.sub(" ", normalized).strip()
+    normalized = re.sub(r"\b\d+\b(?:\s+\d+\b)*$", "", normalized).strip()
 
+    return VENUE_ABBREV_MAP.get(normalized, normalized)
 
 def guess_source_type(raw_title: str, raw_source_title: str) -> str:
     text = normalize_text(f"{raw_title} {raw_source_title}")
@@ -371,14 +539,13 @@ def normalize_work_title(title: Optional[str]) -> tuple[str, list[str]]:
     text = TITLE_LABEL_TAIL_RE.sub(" ", text)
     text = LEADING_LABEL_RE.sub(" ", text)
     text = strip_source_tail(text)
-    text = EDITION_RE.sub(" ", text)
+    text = TRAILING_VENUE_NUMERIC_RE.sub(" ", text)
+    text = TRAILING_EDITION_RE.sub(" ", text)
     text = VOLUME_MARKER_RE.sub(" ", text)
     text = PAGE_DEBRIS_RE.sub(" ", text)
     text = ISSUE_DEBRIS_RE.sub(" ", text)
     text = PROCEEDINGS_RE.sub(" ", text)
     text = VENUE_TAIL_RE.sub(" ", text)
-    for short, long_form in VENUE_ABBREV_MAP.items():
-        text = re.sub(rf"\b{re.escape(short)}\b", long_form, text)
     text = repair_ocr_breaks(text)
 
     text = TRAILING_SOURCE_FRAGMENT_RE.sub("", text)
@@ -389,7 +556,6 @@ def normalize_work_title(title: Optional[str]) -> tuple[str, list[str]]:
 
     tokens = [tok for tok in text.split() if tok and tok not in STOPWORDS]
     return " ".join(tokens), tokens
-
 
 def normalize_author(author: Optional[str]) -> str:
     text = normalize_text(author)
