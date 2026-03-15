@@ -56,22 +56,28 @@ EDITION_RE = re.compile(
     re.I,
 )
 VOLUME_MARKER_RE = re.compile(r"\b(?:vol\.?|volume)\s*\d+\b", re.I)
-PAGE_DEBRIS_RE = re.compile(r"\bpp?\.?\s*\d+[A-Za-z0-9\-–—]*\b", re.I)
-ISSUE_DEBRIS_RE = re.compile(r"\b\d+\s*\(\s*\d+\s*\)\b")
+PAGE_DEBRIS_RE = re.compile(r"\bpp?\.?\s*[A-Za-z]?\d+[A-Za-z]?(?:\s*[-–—]\s*[A-Za-z]?\d+[A-Za-z]?)?\b", re.I)
+ISSUE_DEBRIS_RE = re.compile(r"\b(?:\d+\s*\(\s*\d+\s*\)|issue\s*\d+)\b", re.I)
 PROCEEDINGS_RE = re.compile(
     r"\b(?:in\s+)?proceedings\s+of\b|\bpaper\s+presented\s+at\b|\bconference\s+on\b|\bsymposium\s+on\b|\bworkshop\s+on\b",
     re.I,
 )
 VENUE_TAIL_RE = re.compile(
-    r"\b(?:journal\s+of|transactions\s+on|mis\s*q\b|acad\.?\s*manag\.?\s*rev\.?\b|chi\s*['’]?\d{2}|hicss\b)\b",
+    r"\b(?:journal\s+of|transactions\s+on|interact\.?\s*comput\.?\b|interacting\s+with\s+computers\b|psychol\.?\s*bull\.?\b|acad\.?\s*med\.?\b|organ\.?\s*sci\.?\b|ecol\.?\s*psychol\.?\b|mis\s*q\b|acad\.?\s*manag\.?\s*rev\.?\b|chi\s*['’]?\d{2}|hicss\b|acm\b)\b",
     re.I,
 )
+TRAILING_SOURCE_FRAGMENT_RE = re.compile(r"(?:[,;:]\s*)?(international|information|european|practice|work)\s*$", re.I)
+DOI_CONTAM_RE = re.compile(r"\bdoi\b|doi\.org|10\.\d{4,9}/", re.I)
+URL_RE = re.compile(r"https?://\S+", re.I)
+DUPLICATED_PHRASE_RE = re.compile(r"\b(.{20,}?)\s+\1\b", re.I)
+TITLE_LABEL_TAIL_RE = re.compile(r"\[[^\]]{1,40}\]\s*$")
+OCR_HYPHEN_BREAK_RE = re.compile(r"\b([a-z]{3,})\s*[-‐]\s*([a-z]{3,})\b", re.I)
+OCR_SPACE_BREAK_RE = re.compile(r"\b([a-z]{1,3})\s+([a-z]{5,})\b", re.I)
 SUSPICIOUS_TITLE_TOKENS = {
     "doi", "proceedings", "conference", "symposium", "workshop", "journal",
-    "transactions", "vol", "volume", "issue", "pp", "pages", "presented",
+    "transactions", "vol", "volume", "pp", "pages", "presented", "http", "acm", "international",
 }
 OCR_SPLIT_RE = re.compile(r"\b([a-z]{2,})\s*[-‐]\s+([a-z]{2,})\b")
-OCR_JOIN_RE = re.compile(r"\b(human)\s+(computer)\b|\b(coll)\s+(ision)\b", re.I)
 
 DEFAULT_AUTO_TITLE_THRESHOLD = 92
 DEFAULT_REVIEW_TITLE_MIN = 85
@@ -98,6 +104,15 @@ UK_US_MAP = {
 }
 
 
+VENUE_ABBREV_MAP = {
+    "psychol bull": "psychological bulletin",
+    "acad med": "academic medicine",
+    "organ sci": "organization science",
+    "ecol psychol": "ecological psychology",
+    "interact comput": "interacting with computers",
+}
+
+
 @dataclass
 class RefRecord:
     source_ref_id: Any
@@ -106,6 +121,8 @@ class RefRecord:
     raw_first_author: str
     raw_year: Optional[int]
     raw_doi: str
+    title_display_norm: str
+    title_display_tokens: list[str]
     title_norm: str
     title_tokens: list[str]
     work_title_norm: str
@@ -157,8 +174,20 @@ def normalize_text(text: Optional[str]) -> str:
     return normalized
 
 
-def normalize_title(title: Optional[str]) -> tuple[str, list[str]]:
+def normalize_display_title(title: Optional[str]) -> tuple[str, list[str]]:
     text = normalize_text(title)
+    if not text:
+        return "", []
+    text = strip_doi_fragments(text)
+    text = TITLE_LABEL_TAIL_RE.sub(" ", text)
+    text = TRAILING_SOURCE_FRAGMENT_RE.sub("", text)
+    text = WS_REGEX.sub(" ", text).strip()
+    tokens = [tok for tok in text.split() if tok]
+    return " ".join(tokens), tokens
+
+
+def normalize_title(title: Optional[str]) -> tuple[str, list[str]]:
+    text, _ = normalize_display_title(title)
     if not text:
         return "", []
     tokens = [tok for tok in text.split() if tok and tok not in STOPWORDS]
@@ -173,27 +202,49 @@ def strip_doi_fragments(text: str) -> str:
 
 
 def strip_source_tail(text: str) -> str:
-    """Remove obvious source/proceedings tails appended to a title field."""
-    parts = [p.strip() for p in re.split(r"\s*[,;:]\s*", text) if p.strip()]
+    """Remove source/container tails with strong metadata evidence."""
+    cleaned = normalize_text(text)
+    if not cleaned:
+        return ""
+
+    parts = [p.strip() for p in re.split(r"\s*[,;]\s*", cleaned) if p.strip()]
     if len(parts) <= 1:
-        return text
+        return TRAILING_SOURCE_FRAGMENT_RE.sub("", cleaned).strip(" ,;:")
 
     kept: list[str] = []
     for idx, part in enumerate(parts):
         if idx > 0 and (PROCEEDINGS_RE.search(part) or VENUE_TAIL_RE.search(part)):
             break
-        if idx > 0 and re.search(r"\b(?:vol\.?|volume|pp?\.?|issue)\b", part, re.I):
+        if idx > 0 and re.search(r"\b(?:vol\.?|volume|pp?\.?)\b", part, re.I):
+            break
+        if idx > 0 and ISSUE_DEBRIS_RE.search(part):
+            break
+        if idx > 0 and TRAILING_SOURCE_FRAGMENT_RE.fullmatch(part):
             break
         kept.append(part)
 
-    return ", ".join(kept) if kept else parts[0]
+    candidate = ", ".join(kept) if kept else parts[0]
+    candidate = TRAILING_SOURCE_FRAGMENT_RE.sub("", candidate).strip(" ,;:")
+    return candidate
 
 
 def repair_ocr_breaks(text: str) -> str:
-    text = OCR_SPLIT_RE.sub(r"\1\2", text)
-    text = OCR_JOIN_RE.sub(lambda m: "".join(tok for tok in m.groups() if tok), text)
-    text = re.sub(r"\bna ture\b", "nature", text, flags=re.I)
-    text = re.sub(r"\bconcep tual\b", "conceptual", text, flags=re.I)
+    """Repair OCR-only splits conservatively; never join arbitrary compounds."""
+    text = OCR_HYPHEN_BREAK_RE.sub(r"\1\2", text)
+
+    def _repair_space_break(match: re.Match[str]) -> str:
+        left, right = match.group(1), match.group(2)
+        if left in {"aff", "ico", "con", "na", "co", "coll"}:
+            return f"{left}{right}"
+        return match.group(0)
+
+    text = OCR_SPACE_BREAK_RE.sub(_repair_space_break, text)
+    text = re.sub(r"\bconcep\s+tual\b", "conceptual", text, flags=re.I)
+    text = re.sub(r"\bna\s+ture\b", "nature", text, flags=re.I)
+    text = re.sub(r"\bico\s+nicity\b", "iconicity", text, flags=re.I)
+    text = re.sub(r"\bcoll\s+ision\b", "collision", text, flags=re.I)
+    text = re.sub(r"\ba\s+ffordances\b", "affordances", text, flags=re.I)
+    text = re.sub(r"\baff\s+ordances\b", "affordances", text, flags=re.I)
     return text
 
 
@@ -210,7 +261,9 @@ def normalize_work_title(title: Optional[str]) -> tuple[str, list[str]]:
 
     text = unidecode(str(title)).lower()
     text = strip_doi_fragments(text)
+    text = URL_RE.sub(" ", text)
     text = BRACKET_LABEL_RE.sub(" ", text)
+    text = TITLE_LABEL_TAIL_RE.sub(" ", text)
     text = strip_source_tail(text)
     text = EDITION_RE.sub(" ", text)
     text = VOLUME_MARKER_RE.sub(" ", text)
@@ -218,10 +271,14 @@ def normalize_work_title(title: Optional[str]) -> tuple[str, list[str]]:
     text = ISSUE_DEBRIS_RE.sub(" ", text)
     text = PROCEEDINGS_RE.sub(" ", text)
     text = VENUE_TAIL_RE.sub(" ", text)
+    for short, long_form in VENUE_ABBREV_MAP.items():
+        text = re.sub(rf"\b{re.escape(short)}\b", long_form, text)
     text = repair_ocr_breaks(text)
 
+    text = TRAILING_SOURCE_FRAGMENT_RE.sub("", text)
     text = PUNCT_REGEX.sub(" ", text)
     text = normalize_spelling_for_match(text)
+    text = re.sub(r"\bwell\s+being\b", "wellbeing", text)
     text = WS_REGEX.sub(" ", text).strip()
 
     tokens = [tok for tok in text.split() if tok and tok not in STOPWORDS]
@@ -391,20 +448,26 @@ def title_noise_score(raw_title: str) -> int:
     penalty += 2 if re.search(r"\b\w+[-‐]\s+\w+\b", raw_title) else 0
     penalty += 1 if PROCEEDINGS_RE.search(raw_title) else 0
     penalty += 1 if VENUE_TAIL_RE.search(raw_title) else 0
+    penalty += 4 if DOI_CONTAM_RE.search(raw_title) else 0
+    penalty += 3 if URL_RE.search(raw_title) else 0
+    penalty += 3 if TRAILING_SOURCE_FRAGMENT_RE.search(raw_title or "") else 0
+    penalty += 4 if DUPLICATED_PHRASE_RE.search(normalized) else 0
+    penalty += 2 if OCR_HYPHEN_BREAK_RE.search(raw_title) else 0
     return penalty
 
 
 def choose_canonical(records: list[RefRecord]) -> RefRecord:
     """Choose the cleanest representative, not the longest string."""
 
-    def score(record: RefRecord) -> tuple[int, int, int, int, int, int]:
+    def score(record: RefRecord) -> tuple[int, int, int, int, int, int, int]:
         noise = title_noise_score(record.raw_title)
         return (
-            1 if record.doi_norm else 0,
+            1 if record.year is not None and record.first_author_norm else 0,
+            1 if record.doi_norm and not DOI_CONTAM_RE.search(record.raw_title) else 0,
             -noise,
             len(record.work_title_tokens),
+            len(record.title_display_tokens),
             len(record.title_tokens),
-            1 if record.year is not None else 0,
             len(record.raw_first_author or ""),
         )
 
@@ -455,6 +518,7 @@ def build_ref_records(rows: list[dict[str, Any]]) -> list[RefRecord]:
         year = safe_year(row.get("raw_year"))
 
         doi_norm = normalize_doi(raw_doi)
+        title_display_norm, title_display_tokens = normalize_display_title(raw_title)
         title_norm, title_tokens = normalize_title(raw_title)
         work_title_norm, work_title_tokens = normalize_work_title(raw_title)
         first_author_norm = normalize_author(raw_first_author)
@@ -477,6 +541,8 @@ def build_ref_records(rows: list[dict[str, Any]]) -> list[RefRecord]:
                 raw_first_author=raw_first_author,
                 raw_year=year,
                 raw_doi=raw_doi,
+                title_display_norm=title_display_norm,
+                title_display_tokens=title_display_tokens,
                 title_norm=title_norm,
                 title_tokens=title_tokens,
                 work_title_norm=work_title_norm,
@@ -624,7 +690,7 @@ def apply_tier3_fuzzy(
                             similarity,
                             float(overlap),
                             "manual_review",
-                            "same_author_same_year_work_title_borderline_similarity",
+                            "same_author_same_year_work_title_ambiguous",
                         )
                     )
 
@@ -698,7 +764,7 @@ def materialize_clusters(
         cluster_rows.append(
             (
                 cluster_id,
-                canonical.raw_title or canonical.title_norm,
+                canonical.title_display_norm or canonical.raw_title or canonical.title_norm,
                 canonical.raw_first_author or canonical.first_author_norm,
                 canonical.year,
                 None,
