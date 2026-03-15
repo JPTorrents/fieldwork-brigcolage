@@ -6,15 +6,27 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from unidecode import unidecode
 
-from parse_references import segment_reference_blob
-
-
 CSV_PATH = Path("data/raw/scopus_affordance_2010_2026.csv")
 DB_PATH = Path("data/processed/affordance_lit.sqlite")
+
+YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+DOI_RE = re.compile(r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", re.I)
+DOI_URL_RE = re.compile(r"https?://(?:dx\.)?doi\.org/\S+", re.I)
+URL_RE = re.compile(r"https?://\S+", re.I)
+SPACE_RE = re.compile(r"\s+")
+PAREN_YEAR_ONLY_RE = re.compile(r"^\(?\s*(19\d{2}|20\d{2})\s*\)?[.,;:]*$")
+AUTHOR_TOKEN_RE = re.compile(r"^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\-]+$")
+AUTHOR_INITIALS_RE = re.compile(r"^(?:[A-Z](?:\.[A-Z]){0,4}\.?|[A-Z]\.)$")
+BIBLIO_CUE_RE = re.compile(
+    r"\b(pp?\.?|vol\.?|volume|issue|journal|proceedings|conference|press|doi|retrieved|available|in:)\b",
+    re.I,
+)
+TITLE_LIKE_RE = re.compile(r"[,:]\s*[A-Za-z].{10,}")
 
 REQUIRED_TABLES = {
     "documents",
@@ -106,6 +118,165 @@ def split_semicolon_field(value) -> list[str]:
         return []
     parts = [part.strip() for part in text.split(";")]
     return [part for part in parts if part]
+
+
+def normalize_whitespace(text: str | None) -> str:
+    return SPACE_RE.sub(" ", (text or "")).strip()
+
+
+def has_year(text: str) -> bool:
+    return bool(YEAR_RE.search(text))
+
+
+def has_doi(text: str) -> bool:
+    return bool(DOI_RE.search(text) or DOI_URL_RE.search(text))
+
+
+def has_url(text: str) -> bool:
+    return bool(URL_RE.search(text))
+
+
+def semicolon_count(text: str) -> int:
+    return text.count(";") if text else 0
+
+
+def is_year_only_fragment(text: str) -> bool:
+    s = normalize_whitespace(text.strip(" \t\n\r[](){}"))
+    return bool(s and PAREN_YEAR_ONLY_RE.match(s))
+
+
+def _looks_like_author_name(text: str) -> bool:
+    s = normalize_whitespace(text.strip(" ,;:."))
+    if not s:
+        return False
+    comma_parts = [p.strip() for p in s.replace(",", " ").split() if p.strip()]
+    if not 2 <= len(comma_parts) <= 5:
+        return False
+    has_surname = any(AUTHOR_TOKEN_RE.match(token) for token in comma_parts)
+    has_initial = any(AUTHOR_INITIALS_RE.match(token.rstrip(".")) or AUTHOR_INITIALS_RE.match(token) for token in comma_parts)
+    return has_surname and has_initial
+
+
+def is_author_only_fragment(text: str) -> bool:
+    s = normalize_whitespace(text.strip(" ,;:."))
+    if not s or has_year(s) or has_doi(s) or has_url(s):
+        return False
+    return ";" not in s and _looks_like_author_name(s) and len(s) <= 80
+
+
+def is_author_list_fragment(text: str) -> bool:
+    s = normalize_whitespace(text.strip(" ,;:."))
+    if not s or has_year(s) or has_doi(s) or has_url(s) or ";" not in s:
+        return False
+    parts = [normalize_whitespace(part) for part in s.split(";") if normalize_whitespace(part)]
+    if not 2 <= len(parts) <= 12:
+        return False
+    if sum(1 for p in parts if _looks_like_author_name(p)) / len(parts) < 0.8:
+        return False
+    return True
+
+
+def has_strong_bibliographic_structure(text: str) -> bool:
+    s = normalize_whitespace(text)
+    if not s:
+        return False
+    if BIBLIO_CUE_RE.search(s):
+        return True
+    comma_count = s.count(",")
+    if comma_count >= 2 and len(s) >= 60:
+        return True
+    if TITLE_LIKE_RE.search(s) and len(s) >= 70:
+        return True
+    return False
+
+
+def classify_segment(text: str) -> tuple[str, str]:
+    s = normalize_whitespace(text)
+    if not s:
+        return "fragment", "empty"
+
+    seg_has_year = has_year(s)
+    seg_has_doi = has_doi(s)
+    seg_has_url = has_url(s)
+    seg_semicolons = semicolon_count(s)
+    seg_has_structure = has_strong_bibliographic_structure(s)
+
+    if is_year_only_fragment(s):
+        return "fragment", "year_only_fragment"
+    if is_author_only_fragment(s):
+        return "fragment", "author_only_fragment"
+    if is_author_list_fragment(s):
+        if seg_semicolons >= 3:
+            return "fragment", "semicolon_heavy_no_year"
+        return "fragment", "author_list_no_year"
+    if len(s) < 40 and not (seg_has_year or seg_has_doi or seg_has_url):
+        return "fragment", "too_short_weak_fragment"
+
+    if seg_semicolons >= 3 and not seg_has_year:
+        return "fragment", "semicolon_heavy_no_year"
+
+    if (seg_has_year or seg_has_doi or seg_has_url) and seg_has_structure and len(s) >= 35:
+        return "clean", "strong_anchor"
+
+    if seg_has_year and len(s) >= 35 and not is_author_only_fragment(s):
+        return "needs_review", "weak_structure"
+
+    if not seg_has_year and (seg_has_doi or seg_has_url) and len(s) >= 35:
+        return "needs_review", "anchor_no_year"
+
+    if len(s) >= 60 and s.count(",") >= 2:
+        return "needs_review", "weak_structure"
+
+    return "fragment", "insufficient_structure"
+
+
+def segment_reference_blob(blob: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    text = normalize_whitespace(blob)
+    if not text:
+        return [], []
+
+    chunks = [normalize_whitespace(part) for part in text.split(";") if normalize_whitespace(part)]
+    if not chunks:
+        return [], []
+
+    merged: list[str] = []
+    current = chunks[0]
+    for nxt in chunks[1:]:
+        current_quality, _ = classify_segment(current)
+        next_quality, _ = classify_segment(nxt)
+        if current_quality == "clean" and (next_quality in {"clean", "needs_review"}):
+            merged.append(current)
+            current = nxt
+            continue
+        if next_quality == "fragment":
+            current = f"{current}; {nxt}"
+            continue
+        if has_year(nxt) and not has_year(current):
+            current = f"{current}; {nxt}"
+            continue
+        merged.append(current)
+        current = nxt
+    merged.append(current)
+
+    retained: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for seg in merged:
+        quality, reason = classify_segment(seg)
+        payload = {
+            "raw": seg,
+            "raw_len": len(seg),
+            "has_year": int(has_year(seg)),
+            "has_doi": int(has_doi(seg)),
+            "has_url": int(has_url(seg)),
+            "semicolon_count": semicolon_count(seg),
+            "reason": reason,
+            "quality": quality,
+        }
+        if quality == "fragment":
+            rejected.append(payload)
+        else:
+            retained.append(payload)
+    return retained, rejected
 
 
 
