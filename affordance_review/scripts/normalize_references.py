@@ -73,6 +73,17 @@ DUPLICATED_PHRASE_RE = re.compile(r"\b(.{20,}?)\s+\1\b", re.I)
 TITLE_LABEL_TAIL_RE = re.compile(r"\[[^\]]{1,40}\]\s*$")
 OCR_HYPHEN_BREAK_RE = re.compile(r"\b([a-z]{3,})\s*[-‐]\s*([a-z]{3,})\b", re.I)
 OCR_SPACE_BREAK_RE = re.compile(r"\b([a-z]{1,3})\s+([a-z]{5,})\b", re.I)
+LEADING_LABEL_RE = re.compile(r"^(?:introduction|foreword|preface|editor'?s?\s+comments?|editorial|guest\s+editorial|commentary)\b", re.I)
+AUTHOR_LEAK_RE = re.compile(r",\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*(?:;\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*)+$")
+CONSERVATIVE_JOIN_MAP = {
+    "af fordances": "affordances",
+    "aff ordances": "affordances",
+    "concep tual": "conceptual",
+    "lan guage": "language",
+    "coll ision": "collision",
+    "a case": "acase",
+    "pyschology": "psychology",
+}
 SUSPICIOUS_TITLE_TOKENS = {
     "doi", "proceedings", "conference", "symposium", "workshop", "journal",
     "transactions", "vol", "volume", "pp", "pages", "presented", "http", "acm", "international",
@@ -179,6 +190,8 @@ def normalize_display_title(title: Optional[str]) -> tuple[str, list[str]]:
     if not text:
         return "", []
     text = strip_doi_fragments(text)
+    text = AUTHOR_LEAK_RE.sub("", text).strip(" ,;:")
+    text = LEADING_LABEL_RE.sub("", text).strip(" ,;:")
     text = TITLE_LABEL_TAIL_RE.sub(" ", text)
     text = TRAILING_SOURCE_FRAGMENT_RE.sub("", text)
     text = WS_REGEX.sub(" ", text).strip()
@@ -230,21 +243,23 @@ def strip_source_tail(text: str) -> str:
 
 def repair_ocr_breaks(text: str) -> str:
     """Repair OCR-only splits conservatively; never join arbitrary compounds."""
-    text = OCR_HYPHEN_BREAK_RE.sub(r"\1\2", text)
+    def _join_hyphen_break(match: re.Match[str]) -> str:
+        left, right = match.group(1).lower(), match.group(2).lower()
+        pair = f"{left} {right}"
+        return CONSERVATIVE_JOIN_MAP.get(pair, match.group(0))
+
+    text = OCR_HYPHEN_BREAK_RE.sub(_join_hyphen_break, text)
 
     def _repair_space_break(match: re.Match[str]) -> str:
         left, right = match.group(1), match.group(2)
-        if left in {"aff", "ico", "con", "na", "co", "coll"}:
-            return f"{left}{right}"
+        pair = f"{left.lower()} {right.lower()}"
+        if pair in CONSERVATIVE_JOIN_MAP:
+            return CONSERVATIVE_JOIN_MAP[pair]
         return match.group(0)
 
     text = OCR_SPACE_BREAK_RE.sub(_repair_space_break, text)
-    text = re.sub(r"\bconcep\s+tual\b", "conceptual", text, flags=re.I)
-    text = re.sub(r"\bna\s+ture\b", "nature", text, flags=re.I)
-    text = re.sub(r"\bico\s+nicity\b", "iconicity", text, flags=re.I)
-    text = re.sub(r"\bcoll\s+ision\b", "collision", text, flags=re.I)
-    text = re.sub(r"\ba\s+ffordances\b", "affordances", text, flags=re.I)
-    text = re.sub(r"\baff\s+ordances\b", "affordances", text, flags=re.I)
+    text = re.sub(r"\bpyschology\b", "psychology", text, flags=re.I)
+    text = re.sub(r"\blan\s*[-‐]\s*guage\b", "language", text, flags=re.I)
     return text
 
 
@@ -262,8 +277,10 @@ def normalize_work_title(title: Optional[str]) -> tuple[str, list[str]]:
     text = unidecode(str(title)).lower()
     text = strip_doi_fragments(text)
     text = URL_RE.sub(" ", text)
+    text = AUTHOR_LEAK_RE.sub("", text)
     text = BRACKET_LABEL_RE.sub(" ", text)
     text = TITLE_LABEL_TAIL_RE.sub(" ", text)
+    text = LEADING_LABEL_RE.sub(" ", text)
     text = strip_source_tail(text)
     text = EDITION_RE.sub(" ", text)
     text = VOLUME_MARKER_RE.sub(" ", text)
@@ -453,21 +470,25 @@ def title_noise_score(raw_title: str) -> int:
     penalty += 3 if TRAILING_SOURCE_FRAGMENT_RE.search(raw_title or "") else 0
     penalty += 4 if DUPLICATED_PHRASE_RE.search(normalized) else 0
     penalty += 2 if OCR_HYPHEN_BREAK_RE.search(raw_title) else 0
+    penalty += 5 if AUTHOR_LEAK_RE.search(raw_title) else 0
+    penalty += 4 if LEADING_LABEL_RE.search(normalized) else 0
+    penalty += 4 if re.search(r"\b(?:pp?\.?\s*\d+|vol\.?\s*\d+|issue\s*\d+)\b", normalized) else 0
     return penalty
 
 
 def choose_canonical(records: list[RefRecord]) -> RefRecord:
     """Choose the cleanest representative, not the longest string."""
 
-    def score(record: RefRecord) -> tuple[int, int, int, int, int, int, int]:
+    def score(record: RefRecord) -> tuple[int, int, int, int, int, int, int, int]:
         noise = title_noise_score(record.raw_title)
         return (
             1 if record.year is not None and record.first_author_norm else 0,
             1 if record.doi_norm and not DOI_CONTAM_RE.search(record.raw_title) else 0,
+            1 if record.title_display_norm and not LEADING_LABEL_RE.search(record.title_display_norm) else 0,
             -noise,
-            len(record.work_title_tokens),
-            len(record.title_display_tokens),
-            len(record.title_tokens),
+            -len(record.work_title_tokens),
+            -len(record.title_display_tokens),
+            -len(record.title_tokens),
             len(record.raw_first_author or ""),
         )
 
@@ -676,6 +697,11 @@ def apply_tier3_fuzzy(
                         methods.setdefault(rec_i.source_ref_id, method)
                         methods.setdefault(rec_j.source_ref_id, method)
                 elif review_title_min <= similarity < auto_title_threshold:
+                    if overlap >= 0.80 and similarity >= review_title_min + 2:
+                        if dsu.union(root_i, root_j):
+                            methods.setdefault(rec_i.source_ref_id, "high_overlap_fuzzy")
+                            methods.setdefault(rec_j.source_ref_id, "high_overlap_fuzzy")
+                        continue
                     review_rows.append(
                         (
                             as_str_id(rec_i.source_ref_id),

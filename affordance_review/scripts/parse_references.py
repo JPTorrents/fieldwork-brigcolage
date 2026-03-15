@@ -43,8 +43,19 @@ PROCEEDINGS_RE = re.compile(
     r"\b(?:in\s+)?proceedings\s+of\b|\bpaper\s+presented\s+at\b|\bconference\s+on\b|\bsymposium\s+on\b|\bworkshop\s+on\b",
     re.I,
 )
+CONTAINER_CUE_RE = re.compile(
+    r"\b(?:in\s+proceedings\s+of|proceedings\s+of|paper\s+presented\s+at|conference\s+on|symposium\s+on|workshop\s+on|in\s+\w+\s*:)\b",
+    re.I,
+)
 TRUNCATED_SOURCE_TAIL_RE = re.compile(r"^(?:international|information|european|work|practice|acm)$", re.I)
 ISSUE_META_RE = re.compile(r"\b(?:vol\.?\s*\d+\s*(?:\(|,)?\s*issue\s*\d+|issue\s*\d+|\d+\(\d+\))\b", re.I)
+TITLE_LABEL_RE = re.compile(
+    r"^(?:introduction|foreword|preface|editor'?s?\s+comments?|editorial|guest\s+editorial|commentary)\b",
+    re.I,
+)
+AUTHOR_TAIL_RE = re.compile(
+    r",\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*(?:;\s*[A-Z][A-Za-z'\-]+\s+[A-Z](?:\.[A-Z])?\.?\s*)+$"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,7 +99,8 @@ def normalize_ref_string(text: Optional[str]) -> Optional[str]:
 
 def strip_doi_noise(raw: str) -> str:
     """Remove DOI URLs/fragments so they do not pollute title/source extraction."""
-    cleaned = DOI_URL_RE.sub(" ", raw)
+    cleaned = re.sub(r"\b(?:retrieved\s+from|available\s+at)\s+https?://\S+", " ", raw, flags=re.I)
+    cleaned = DOI_URL_RE.sub(" ", cleaned)
     cleaned = DOI_PREFIX_RE.sub(" ", cleaned)
     cleaned = DOI_RE.sub(" ", cleaned)
     return normalize_whitespace(cleaned)
@@ -268,6 +280,13 @@ def split_title_source_by_hints(working: str) -> tuple[str, Optional[str]]:
         if left and right:
             return left, right
 
+    in_match = CONTAINER_CUE_RE.search(working)
+    if in_match and in_match.start() > 12:
+        left = working[: in_match.start()].strip(" ,;:.-")
+        right = working[in_match.start() :].strip(" ,;:.-")
+        if left and right:
+            return left, right
+
     parts = [p.strip(" ,;:.") for p in re.split(r"\s*[,;]\s*", working) if p.strip(" ,;:.")]
     if len(parts) >= 3 and (PROCEEDINGS_RE.search(parts[-1]) or VENUE_SPLIT_HINT_RE.search(parts[-1])):
         return ", ".join(parts[:-1]).strip(), parts[-1].strip()
@@ -276,6 +295,41 @@ def split_title_source_by_hints(working: str) -> tuple[str, Optional[str]]:
         if VENUE_SPLIT_HINT_RE.search(right) or len(right.split()) >= 3:
             return left, right
     return working.strip(" ,;:."), None
+
+
+def strip_author_leakage_tail(title: Optional[str]) -> Optional[str]:
+    if not title:
+        return None
+    cleaned = AUTHOR_TAIL_RE.sub("", title).strip(" ,;:.")
+    return cleaned or None
+
+
+def clean_title_candidate(title: Optional[str], source_title: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    if not title:
+        return None, source_title
+
+    cleaned = normalize_whitespace(title.strip(" \"'“”‘’"))
+    cleaned = strip_author_leakage_tail(cleaned)
+
+    if cleaned and re.search(r"\bpp?\.?\s*\d", cleaned, re.I):
+        cleaned = re.sub(r",?\s*pp?\.?\s*\d+.*$", "", cleaned, flags=re.I).strip(" ,;:.") or None
+
+    if cleaned and re.search(r",\s*\d{1,4}\s*,\s*[A-Za-z0-9\-]{1,20}$", cleaned):
+        cleaned = re.sub(r",\s*\d{1,4}\s*,\s*[A-Za-z0-9\-]{1,20}$", "", cleaned).strip(" ,;:.") or None
+
+    if cleaned and (PROCEEDINGS_RE.search(cleaned) or ISSUE_META_RE.search(cleaned)):
+        cutoff = None
+        for rex in (PROCEEDINGS_RE, ISSUE_META_RE):
+            m = rex.search(cleaned)
+            if m:
+                cutoff = m.start() if cutoff is None else min(cutoff, m.start())
+        if cutoff is not None and cutoff > 8:
+            src_tail = cleaned[cutoff:].strip(" ,;:.-")
+            cleaned = cleaned[:cutoff].strip(" ,;:.-") or None
+            if src_tail:
+                source_title = src_tail if not source_title else f"{src_tail}, {source_title}"
+
+    return cleaned, source_title
 
 
 def split_title_and_source(rest: str) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
@@ -293,8 +347,8 @@ def split_title_and_source(rest: str) -> tuple[Optional[str], Optional[str], Opt
     title, source_title = split_title_source_by_hints(working)
     title, _edition_marker = strip_edition_markers(title)
 
-    if title:
-        title = normalize_whitespace(title.strip(" \"'“”‘’"))
+    title, source_title = clean_title_candidate(title, source_title)
+
     if source_title:
         source_title = normalize_whitespace(source_title.strip(" \"'“”‘’"))
         source_title = SOURCE_BOILERPLATE_RE.sub(lambda m: normalize_whitespace(m.group(0)), source_title)
@@ -305,24 +359,6 @@ def split_title_and_source(rest: str) -> tuple[Optional[str], Optional[str], Opt
         else:
             source_title = title
         title = None
-
-    if title and re.search(r"\bpp?\.\b", title, re.I):
-        title = re.sub(r",?\s*pp?\..*$", "", title, flags=re.I).strip(" ,;:.") or None
-
-    if title and re.search(r",\s*\d{1,4}\s*,\s*[A-Za-z0-9\-]{1,20}$", title):
-        title = re.sub(r",\s*\d{1,4}\s*,\s*[A-Za-z0-9\-]{1,20}$", "", title).strip(" ,;:.") or None
-
-    if title and (PROCEEDINGS_RE.search(title) or ISSUE_META_RE.search(title)):
-        cutoff = None
-        for rex in (PROCEEDINGS_RE, ISSUE_META_RE):
-            m = rex.search(title)
-            if m:
-                cutoff = m.start() if cutoff is None else min(cutoff, m.start())
-        if cutoff is not None and cutoff > 6:
-            src_tail = title[cutoff:].strip(" ,;:.-")
-            title = title[:cutoff].strip(" ,;:.-") or None
-            if src_tail:
-                source_title = src_tail if not source_title else f"{src_tail}, {source_title}"
 
     return title, source_title, volume, issue, pages
 
@@ -346,6 +382,9 @@ def score_parse_quality(
     if is_probable_fragment(raw):
         return "failed"
 
+    if title and len(title) < 3:
+        return "low"
+
     if has_internal_year_boundary(raw) or has_multiple_years(raw):
         if first_author and year:
             return "medium"
@@ -354,6 +393,8 @@ def score_parse_quality(
     if first_author and year and title:
         if len(title) >= 12 and not re.fullmatch(r"[A-Z][a-z]?$", title):
             if TRUNCATED_SOURCE_TAIL_RE.match(title) or len(title.split()) == 1:
+                return "medium"
+            if TITLE_LABEL_RE.match(title) and not source_title:
                 return "medium"
             return "high"
 
@@ -375,6 +416,9 @@ def parse_reference(raw: str) -> dict[str, Any]:
     first_author = clean_first_author(author_block) if author_block else None
 
     title, source_title, volume, issue, pages = split_title_and_source(rest)
+
+    if title and TITLE_LABEL_RE.match(title) and not source_title and not doi:
+        source_title = "front-matter-label"
 
     parse_quality = score_parse_quality(raw, first_author, year, title, source_title)
 
