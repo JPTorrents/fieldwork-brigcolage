@@ -169,74 +169,91 @@ def resolve_column(columns: list[str], candidates: list[str], table_name: str) -
     )
 
 
+def ensure_table_exists(conn: sqlite3.Connection, table_name: str, create_sql: str) -> None:
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    if not exists:
+        conn.execute(create_sql)
+
+
 def ensure_output_tables(conn: sqlite3.Connection) -> None:
-    """Recreate derived normalization tables with a known-good schema.
-
-    This intentionally rebuilds only downstream derived tables so that legacy
-    schema drift (including broken foreign key definitions) cannot break reruns.
-    """
-    conn.execute("PRAGMA foreign_keys = OFF")
-    try:
-        conn.executescript(
-            """
-            DROP TABLE IF EXISTS internal_citations;
-            DROP TABLE IF EXISTS reference_cluster_review;
-            DROP TABLE IF EXISTS document_reference_links;
-            DROP TABLE IF EXISTS reference_clusters;
-
-            CREATE TABLE reference_clusters (
-                cluster_id TEXT PRIMARY KEY,
-                canonical_title TEXT,
-                canonical_first_author TEXT,
-                canonical_year INTEGER,
-                canonical_source_title TEXT,
-                canonical_doi TEXT,
-                cluster_confidence TEXT,
-                cluster_method TEXT,
-                member_count INTEGER,
-                source_ref_ids TEXT
-            );
-
-            CREATE TABLE document_reference_links (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doc_id INTEGER,
-                source_ref_id INTEGER,
-                cluster_id TEXT,
-                link_method TEXT,
-                link_confidence TEXT,
-                FOREIGN KEY(cluster_id) REFERENCES reference_clusters(cluster_id)
-            );
-
-            CREATE TABLE reference_cluster_review (
-                review_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ref_id_1 INTEGER,
-                ref_id_2 INTEGER,
-                cluster_id_1 TEXT,
-                cluster_id_2 TEXT,
-                first_author_norm TEXT,
-                year_1 INTEGER,
-                year_2 INTEGER,
-                title_1 TEXT,
-                title_2 TEXT,
-                title_similarity REAL,
-                title_overlap REAL,
-                suggested_action TEXT,
-                reason TEXT
-            );
-
-            CREATE TABLE internal_citations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                citing_doc_id INTEGER,
-                cited_doc_id INTEGER,
-                cluster_id TEXT,
-                match_method TEXT,
-                match_confidence TEXT
-            );
-            """
+    ensure_table_exists(
+        conn,
+        "reference_clusters",
+        """
+        CREATE TABLE reference_clusters (
+            cluster_id TEXT PRIMARY KEY,
+            canonical_title TEXT,
+            canonical_first_author TEXT,
+            canonical_year INTEGER,
+            canonical_source_title TEXT,
+            canonical_doi TEXT,
+            cluster_confidence TEXT,
+            cluster_method TEXT,
+            member_count INTEGER,
+            source_ref_ids TEXT
         )
-        conn.commit()
-    finally:
-        conn.execute("PRAGMA foreign_keys = ON")
+        """,
+    )
+    ensure_table_exists(
+        conn,
+        "document_reference_links",
+        """
+        CREATE TABLE document_reference_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id INTEGER,
+            source_ref_id INTEGER,
+            cluster_id TEXT,
+            link_method TEXT,
+            link_confidence TEXT,
+            FOREIGN KEY(cluster_id) REFERENCES reference_clusters(cluster_id)
+        )
+        """,
+    )
+    ensure_table_exists(
+        conn,
+        "reference_cluster_review",
+        """
+        CREATE TABLE reference_cluster_review (
+            review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ref_id_1 INTEGER,
+            ref_id_2 INTEGER,
+            cluster_id_1 TEXT,
+            cluster_id_2 TEXT,
+            first_author_norm TEXT,
+            year_1 INTEGER,
+            year_2 INTEGER,
+            title_1 TEXT,
+            title_2 TEXT,
+            title_similarity REAL,
+            title_overlap REAL,
+            suggested_action TEXT,
+            reason TEXT
+        )
+        """,
+    )
+    ensure_table_exists(
+        conn,
+        "internal_citations",
+        """
+        CREATE TABLE internal_citations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            citing_doc_id INTEGER,
+            cited_doc_id INTEGER,
+            cluster_id TEXT,
+            match_method TEXT,
+            match_confidence TEXT
+        )
+        """,
+    )
+
+    conn.execute("DELETE FROM reference_clusters")
+    conn.execute("DELETE FROM document_reference_links")
+    conn.execute("DELETE FROM reference_cluster_review")
+    conn.execute("DELETE FROM internal_citations")
+    conn.commit()
 
 
 def choose_canonical(records: list[RefRecord]) -> RefRecord:
