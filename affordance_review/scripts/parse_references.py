@@ -18,11 +18,12 @@ DOI_URL_RE = re.compile(r"https?://(?:dx\.)?doi\.org/\S+", re.I)
 DOI_PREFIX_RE = re.compile(r"\bdoi\s*[:=]?\s*(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", re.I)
 YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
 PAREN_YEAR_RE = re.compile(r"\((19\d{2}|20\d{2})\)")
+YEAR_BOUNDARY_RE = re.compile(r"^(?P<author>.+?)\s*[\(\[,;.]\s*(?P<year>19\d{2}|20\d{2})[\)\],;.]\s*(?P<rest>.+)$")
 PAGES_RE = re.compile(
-    r"\bpp?\.\s*([A-Za-z0-9]+(?:\s*[-–—]\s*[A-Za-z0-9]+)?)",
+    r"\bpp?\.?\s*([A-Za-z]?\d+[A-Za-z]?(?:\s*[-–—]\s*[A-Za-z]?\d+[A-Za-z]?)?)",
     re.I,
 )
-VOL_ISSUE_RE = re.compile(r",\s*(\d{1,4})\s*,\s*([A-Za-z0-9\-]{1,20})(?=,|\s*\(|\s*$)")
+VOL_ISSUE_RE = re.compile(r"\b(?:vol\.?|volume)\s*(\d{1,4})\s*(?:,?\s*(?:no\.?|issue)\s*([A-Za-z0-9\-]{1,10}))?\b", re.I)
 VOL_ONLY_RE = re.compile(r",\s*(\d{1,4})(?=,?\s*pp?\.|,?\s*\(|\s*$)", re.I)
 SPACE_RE = re.compile(r"\s+")
 TRAILING_PUNCT_RE = re.compile(r"[\s,;:.]+$")
@@ -38,6 +39,12 @@ SOURCE_BOILERPLATE_RE = re.compile(
     r"\b(?:proceedings\s+of\s+the|in\s+proceedings\s+of|paper\s+presented\s+at|conference\s+on|symposium\s+on|workshop\s+on|journal\s+of|transactions\s+on|mis\s+q\.?|acad\.?\s*manag\.?\s*rev\.?)\b",
     re.I,
 )
+PROCEEDINGS_RE = re.compile(
+    r"\b(?:in\s+)?proceedings\s+of\b|\bpaper\s+presented\s+at\b|\bconference\s+on\b|\bsymposium\s+on\b|\bworkshop\s+on\b",
+    re.I,
+)
+TRUNCATED_SOURCE_TAIL_RE = re.compile(r"^(?:international|information|european|work|practice|acm)$", re.I)
+ISSUE_META_RE = re.compile(r"\b(?:vol\.?\s*\d+\s*(?:\(|,)?\s*issue\s*\d+|issue\s*\d+|\d+\(\d+\))\b", re.I)
 
 
 def parse_args() -> argparse.Namespace:
@@ -178,6 +185,12 @@ def clean_first_author(author_block: Optional[str]) -> Optional[str]:
 def split_author_and_rest(raw: str) -> tuple[Optional[str], str]:
     s = normalize_whitespace(raw)
 
+    m = YEAR_BOUNDARY_RE.match(s)
+    if m:
+        author_candidate = m.group("author").strip(" ,;:.")
+        if looks_like_author_block(author_candidate) or ("," in author_candidate and len(author_candidate) <= 120):
+            return author_candidate, m.group("rest").strip()
+
     comma_positions = [m.start() for m in re.finditer(",", s)]
     for pos in comma_positions:
         left = s[:pos].strip()
@@ -213,6 +226,14 @@ def extract_volume_issue(text: str) -> tuple[Optional[str], Optional[str]]:
     if m:
         return m.group(1), m.group(2)
 
+    m = re.search(r"\b(\d{1,4})\s*\(\s*([A-Za-z]?\d{1,4})\s*\)", text)
+    if m:
+        return m.group(1), m.group(2)
+
+    m = re.search(r",\s*(\d{1,4})\s*,\s*([A-Za-z]?\d{1,4})(?=,|\s*$)", text)
+    if m:
+        return m.group(1), m.group(2)
+
     m = VOL_ONLY_RE.search(text)
     if m:
         return m.group(1), None
@@ -229,8 +250,9 @@ def strip_right_metadata(text: str) -> tuple[str, Optional[str], Optional[str], 
     pages = extract_pages(working)
     volume, issue = extract_volume_issue(working)
 
-    working = re.sub(r",?\s*pp?\.\s*[A-Za-z0-9]+(?:\s*[-–—]\s*[A-Za-z0-9]+)?", "", working, flags=re.I)
-    working = re.sub(r",\s*\d{1,4}\s*,\s*[A-Za-z0-9\-]{1,20}(?=,|\s*$)", "", working)
+    working = re.sub(r",?\s*pp?\.?\s*[A-Za-z]?\d+[A-Za-z]?(?:\s*[-–—]\s*[A-Za-z]?\d+[A-Za-z]?)?", "", working, flags=re.I)
+    working = re.sub(r",?\s*(?:vol\.?|volume)\s*\d+(?:\s*\(\s*\d+\s*\))?", "", working, flags=re.I)
+    working = re.sub(r",?\s*\d+\s*\(\s*\d+\s*\)", "", working)
     working = re.sub(r",\s*\d{1,4}(?=,?\s*$)", "", working)
     working = normalize_whitespace(working.strip(" ,;"))
 
@@ -246,8 +268,8 @@ def split_title_source_by_hints(working: str) -> tuple[str, Optional[str]]:
         if left and right:
             return left, right
 
-    parts = [p.strip(" ,;:.") for p in working.split(",") if p.strip(" ,;:.")]
-    if len(parts) >= 3:
+    parts = [p.strip(" ,;:.") for p in re.split(r"\s*[,;]\s*", working) if p.strip(" ,;:.")]
+    if len(parts) >= 3 and (PROCEEDINGS_RE.search(parts[-1]) or VENUE_SPLIT_HINT_RE.search(parts[-1])):
         return ", ".join(parts[:-1]).strip(), parts[-1].strip()
     if len(parts) == 2:
         left, right = parts
@@ -277,11 +299,30 @@ def split_title_and_source(rest: str) -> tuple[Optional[str], Optional[str], Opt
         source_title = normalize_whitespace(source_title.strip(" \"'“”‘’"))
         source_title = SOURCE_BOILERPLATE_RE.sub(lambda m: normalize_whitespace(m.group(0)), source_title)
 
+    if title and TRUNCATED_SOURCE_TAIL_RE.match(title):
+        if source_title:
+            source_title = f"{title}, {source_title}"
+        else:
+            source_title = title
+        title = None
+
     if title and re.search(r"\bpp?\.\b", title, re.I):
         title = re.sub(r",?\s*pp?\..*$", "", title, flags=re.I).strip(" ,;:.") or None
 
     if title and re.search(r",\s*\d{1,4}\s*,\s*[A-Za-z0-9\-]{1,20}$", title):
         title = re.sub(r",\s*\d{1,4}\s*,\s*[A-Za-z0-9\-]{1,20}$", "", title).strip(" ,;:.") or None
+
+    if title and (PROCEEDINGS_RE.search(title) or ISSUE_META_RE.search(title)):
+        cutoff = None
+        for rex in (PROCEEDINGS_RE, ISSUE_META_RE):
+            m = rex.search(title)
+            if m:
+                cutoff = m.start() if cutoff is None else min(cutoff, m.start())
+        if cutoff is not None and cutoff > 6:
+            src_tail = title[cutoff:].strip(" ,;:.-")
+            title = title[:cutoff].strip(" ,;:.-") or None
+            if src_tail:
+                source_title = src_tail if not source_title else f"{src_tail}, {source_title}"
 
     return title, source_title, volume, issue, pages
 
@@ -312,6 +353,8 @@ def score_parse_quality(
 
     if first_author and year and title:
         if len(title) >= 12 and not re.fullmatch(r"[A-Z][a-z]?$", title):
+            if TRUNCATED_SOURCE_TAIL_RE.match(title) or len(title.split()) == 1:
+                return "medium"
             return "high"
 
     if first_author and year:
