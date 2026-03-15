@@ -18,7 +18,9 @@ Checks:
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
+import re
 import sys
 from typing import Iterable, Optional
 
@@ -63,6 +65,8 @@ ALIGNED_GROUPS = [
     ["Authors", "Author full names", "Author(s) ID"],
 ]
 
+REQUIRED_COLUMNS = ["EID"]
+
 
 def ensure_output_dirs() -> None:
     OUTPUT_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -70,7 +74,16 @@ def ensure_output_dirs() -> None:
     OUTPUT_DUPLICATES.parent.mkdir(parents=True, exist_ok=True)
 
 
-def load_csv_robust(path: Path) -> tuple[pd.DataFrame, str]:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Audit a Scopus CSV export.")
+    parser.add_argument("--input", type=Path, default=INPUT_CSV, help="Input CSV path")
+    parser.add_argument("--output-log", type=Path, default=OUTPUT_LOG, help="Output audit report path")
+    parser.add_argument("--output-missingness", type=Path, default=OUTPUT_MISSINGNESS, help="Output missingness CSV path")
+    parser.add_argument("--output-duplicates", type=Path, default=OUTPUT_DUPLICATES, help="Output duplicates CSV path")
+    return parser.parse_args()
+
+
+def load_csv_robust(path: Path) -> tuple[pd.DataFrame, str, str]:
     """
     Load CSV with a small set of common encoding fallbacks.
     """
@@ -82,14 +95,19 @@ def load_csv_robust(path: Path) -> tuple[pd.DataFrame, str]:
     ]
 
     last_error: Optional[Exception] = None
+    separators = [",", ";", "\t"]
+
     for enc in encodings_to_try:
-        try:
-            df = pd.read_csv(path, encoding=enc, low_memory=False)
-            return df, enc
-        except UnicodeDecodeError as e:
-            last_error = e
-        except Exception as e:
-            last_error = e
+        for sep in separators:
+            try:
+                df = pd.read_csv(path, encoding=enc, low_memory=False, sep=sep)
+                if df.shape[1] <= 1:
+                    continue
+                return df, enc, sep
+            except UnicodeDecodeError as e:
+                last_error = e
+            except Exception as e:
+                last_error = e
 
     raise RuntimeError(f"Failed to read CSV: {path}\nLast error: {last_error}")
 
@@ -238,14 +256,29 @@ def duplicate_rows(df: pd.DataFrame) -> pd.DataFrame:
     return dup
 
 
+def is_probable_duplicate_header(column_name: str) -> bool:
+    return bool(re.search(r"\.\d+$", str(column_name)))
+
+
 def main() -> int:
+    args = parse_args()
+
+    global INPUT_CSV, OUTPUT_LOG, OUTPUT_MISSINGNESS, OUTPUT_DUPLICATES
+    INPUT_CSV = args.input
+    OUTPUT_LOG = args.output_log
+    OUTPUT_MISSINGNESS = args.output_missingness
+    OUTPUT_DUPLICATES = args.output_duplicates
+
     ensure_output_dirs()
 
     if not INPUT_CSV.exists():
         raise FileNotFoundError(f"Input CSV not found: {INPUT_CSV}")
 
-    df_raw, encoding_used = load_csv_robust(INPUT_CSV)
+    df_raw, encoding_used, separator_used = load_csv_robust(INPUT_CSV)
     df = normalize_blank_strings(df_raw)
+
+    duplicate_header_cols = [c for c in df.columns if is_probable_duplicate_header(c)]
+    missing_required_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
 
     n_rows, n_cols = df.shape
 
@@ -288,13 +321,18 @@ def main() -> int:
 
     # Assertions / hard checks
     hard_check_messages = []
-    if "EID" not in df.columns:
-        hard_check_messages.append("FAIL: 'EID' column is missing.")
+    if missing_required_columns:
+        hard_check_messages.append(f"FAIL: Missing required columns: {missing_required_columns}.")
     else:
         if duplicate_eid_count > 0:
             hard_check_messages.append(f"FAIL: Non-unique EID detected ({duplicate_eid_count} rows involved).")
         else:
             hard_check_messages.append("PASS: EID column present and unique.")
+
+    if duplicate_header_cols:
+        hard_check_messages.append(
+            f"WARN: Potential duplicate-header columns detected: {duplicate_header_cols}."
+        )
 
     # Build text report
     lines = []
@@ -302,6 +340,7 @@ def main() -> int:
     lines.append("=" * 80)
     lines.append(f"Input file: {INPUT_CSV}")
     lines.append(f"Encoding used: {encoding_used}")
+    lines.append(f"Delimiter used: {separator_used!r}")
     lines.append(f"Rows: {n_rows:,}")
     lines.append(f"Columns: {n_cols:,}")
     lines.append("")
@@ -394,8 +433,8 @@ def main() -> int:
     print(f"Audit log: {OUTPUT_LOG}")
 
     # Fail at the end if EID duplicates exist, after all outputs are written.
-    if "EID" not in df.columns:
-        raise AssertionError("EID column missing.")
+    if missing_required_columns:
+        raise AssertionError(f"Missing required columns: {missing_required_columns}")
     if duplicate_eid_count > 0:
         raise AssertionError(f"Non-unique EID detected ({duplicate_eid_count} rows involved).")
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import re
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from unidecode import unidecode
 
@@ -23,6 +24,12 @@ VOL_ISSUE_RE = re.compile(r",\s*(\d{1,4})\s*,\s*([A-Za-z0-9\-]{1,20})(?=,|\s*\(|
 VOL_ONLY_RE = re.compile(r",\s*(\d{1,4})(?=,?\s*pp?\.|,?\s*\(|\s*$)", re.I)
 SPACE_RE = re.compile(r"\s+")
 TRAILING_PUNCT_RE = re.compile(r"[\s,;:.]+$")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Parse raw references into cited_references fields.")
+    parser.add_argument("--db", type=Path, default=DB_PATH, help="Path to SQLite database")
+    return parser.parse_args()
 
 
 def normalize_whitespace(text: str) -> str:
@@ -142,7 +149,7 @@ def split_author_and_rest(raw: str) -> tuple[Optional[str], str]:
     comma_positions = [m.start() for m in re.finditer(",", s)]
     for pos in comma_positions:
         left = s[:pos].strip()
-        right = s[pos + 1:].strip()
+        right = s[pos + 1 :].strip()
         if looks_like_author_block(left) and right:
             return left, right
 
@@ -211,7 +218,6 @@ def split_title_and_source(rest: str) -> tuple[Optional[str], Optional[str], Opt
         source_title = parts[-1].strip()
     elif len(parts) == 2:
         left, right = parts
-        # If right looks like a venue, treat it as source title
         if len(right.split()) >= 2:
             title = left
             source_title = right
@@ -227,7 +233,6 @@ def split_title_and_source(rest: str) -> tuple[Optional[str], Optional[str], Opt
     if source_title:
         source_title = normalize_whitespace(source_title.strip(" \"'“”‘’"))
 
-    # Guard against obvious journal leakage into title
     if title and re.search(r"\bpp?\.\b", title, re.I):
         title = re.sub(r",?\s*pp?\..*$", "", title, flags=re.I).strip(" ,;:.") or None
 
@@ -235,6 +240,7 @@ def split_title_and_source(rest: str) -> tuple[Optional[str], Optional[str], Opt
         title = re.sub(r",\s*\d{1,4}\s*,\s*[A-Za-z0-9\-]{1,20}$", "", title).strip(" ,;:.") or None
 
     return title, source_title, volume, issue, pages
+
 
 def has_internal_year_boundary(raw: str) -> bool:
     s = normalize_whitespace(raw)
@@ -245,17 +251,19 @@ def has_multiple_years(raw: str) -> bool:
     return len(re.findall(r"(?<!\d)(17\d{2}|18\d{2}|19\d{2}|20\d{2})(?!\d)", raw)) >= 2
 
 
-def score_parse_quality(raw: str,
-                        first_author: Optional[str],
-                        year: Optional[int],
-                        title: Optional[str],
-                        source_title: Optional[str]) -> str:
+def score_parse_quality(
+    raw: str,
+    first_author: Optional[str],
+    year: Optional[int],
+    title: Optional[str],
+    source_title: Optional[str],
+) -> str:
     if is_probable_fragment(raw):
         return "failed"
 
     if has_internal_year_boundary(raw) or has_multiple_years(raw):
         if first_author and year:
-            return "mediu
+            return "medium"
         return "low"
 
     if first_author and year and title:
@@ -271,8 +279,7 @@ def score_parse_quality(raw: str,
     return "failed"
 
 
-
-def parse_reference(raw: str) -> dict:
+def parse_reference(raw: str) -> dict[str, Any]:
     raw = normalize_whitespace(raw)
     doi = extract_doi(raw)
     year = extract_year(raw)
@@ -321,7 +328,7 @@ def fetch_raw_references(conn: sqlite3.Connection) -> list[tuple[int, int, int, 
     ).fetchall()
 
 
-def insert_cited_reference(conn: sqlite3.Connection, doc_id: int, raw_ref_id: int, parsed: dict) -> None:
+def insert_cited_reference(conn: sqlite3.Connection, doc_id: int, raw_ref_id: int, parsed: dict[str, Any]) -> None:
     conn.execute(
         """
         INSERT INTO cited_references (
@@ -357,10 +364,11 @@ def insert_cited_reference(conn: sqlite3.Connection, doc_id: int, raw_ref_id: in
 
 
 def main() -> int:
-    if not DB_PATH.exists():
-        raise FileNotFoundError(f"SQLite DB not found: {DB_PATH}")
+    args = parse_args()
+    if not args.db.exists():
+        raise FileNotFoundError(f"SQLite DB not found: {args.db}")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(args.db)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         assert_db_ready(conn)
@@ -404,7 +412,7 @@ def main() -> int:
         print(f"  medium: {quality_counts.get('medium', 0)}")
         print(f"  low:    {quality_counts.get('low', 0)}")
         print(f"  failed: {quality_counts.get('failed', 0)}")
-        print(f"Database updated: {DB_PATH}")
+        print(f"Database updated: {args.db}")
 
     finally:
         conn.close()
@@ -414,4 +422,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

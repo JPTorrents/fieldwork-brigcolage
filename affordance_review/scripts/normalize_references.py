@@ -1,56 +1,20 @@
 #!/usr/bin/env python3
-"""
-normalize_references.py
-
-Normalize parsed cited references into deduplicated cited works.
-
-Pipeline:
-1. Tier 1: exact DOI clustering
-2. Tier 2: exact normalized key clustering
-3. Tier 3: fuzzy matching inside blocking groups
-4. Write:
-   - reference_clusters
-   - document_reference_links
-   - reference_cluster_review
-   - internal_citations (optional)
-
-Assumptions:
-- Input SQLite DB already contains a parsed cited references table, default: cited_references
-- Input DB also contains a corpus documents table, default: documents
-- The script attempts to autodetect common column name variants.
-
-Recommended usage:
-    python scripts/normalize_references.py --db data/processed/affordance_lit.sqlite
-
-Core logic:
-- DOI exact match is high-confidence auto-cluster
-- Exact normalized key is high-confidence auto-cluster
-- Fuzzy match within strict blocking:
-    * same normalized first-author surname
-    * same year
-    * title token overlap >= threshold
-  Then:
-    * similarity >= 92 -> auto-cluster
-    * 85-91 -> manual review
-    * < 85 -> separate
-"""
+"""Normalize parsed cited references into conservative deduplicated clusters."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import math
 import re
 import sqlite3
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 from rapidfuzz import fuzz
 from tqdm import tqdm
 from unidecode import unidecode
-
 
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by",
@@ -71,6 +35,10 @@ DOI_REGEX = re.compile(r"""(?i)\b(10\.\d{4,9}/[-._;()/:a-z0-9]+)\b""")
 YEAR_REGEX = re.compile(r"\b(18|19|20)\d{2}\b")
 PUNCT_REGEX = re.compile(r"[^\w\s]")
 WS_REGEX = re.compile(r"\s+")
+
+DEFAULT_AUTO_TITLE_THRESHOLD = 92
+DEFAULT_REVIEW_TITLE_MIN = 85
+DEFAULT_TITLE_OVERLAP_MIN = 0.50
 
 
 @dataclass
@@ -138,9 +106,7 @@ def normalize_author(author: Optional[str]) -> str:
         return ""
     text = re.split(r"\b(and|et al|&)\b|,", text)[0].strip()
     parts = text.split()
-    if not parts:
-        return ""
-    return parts[-1]
+    return parts[-1] if parts else ""
 
 
 def normalize_doi(doi: Optional[str]) -> str:
@@ -157,9 +123,7 @@ def safe_year(value: Any) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, int):
-        if 1800 <= value <= 2100:
-            return value
-        return None
+        return value if 1800 <= value <= 2100 else None
     text = str(value).strip()
     if not text:
         return None
@@ -177,9 +141,7 @@ def token_overlap(tokens_a: list[str], tokens_b: list[str]) -> float:
     b = set(tokens_b)
     inter = len(a & b)
     denom = min(len(a), len(b))
-    if denom == 0:
-        return 0.0
-    return inter / denom
+    return (inter / denom) if denom else 0.0
 
 
 def stable_cluster_id(seed: str) -> str:
@@ -207,40 +169,57 @@ def resolve_column(columns: list[str], candidates: list[str], table_name: str) -
     )
 
 
-def ensure_output_tables(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
-        DROP TABLE IF EXISTS reference_clusters;
-        DROP TABLE IF EXISTS document_reference_links;
-        DROP TABLE IF EXISTS reference_cluster_review;
-        DROP TABLE IF EXISTS internal_citations;
+def ensure_table_exists(conn: sqlite3.Connection, table_name: str, create_sql: str) -> None:
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    if not exists:
+        conn.execute(create_sql)
 
+
+def ensure_output_tables(conn: sqlite3.Connection) -> None:
+    ensure_table_exists(
+        conn,
+        "reference_clusters",
+        """
         CREATE TABLE reference_clusters (
             cluster_id TEXT PRIMARY KEY,
             canonical_title TEXT,
             canonical_first_author TEXT,
             canonical_year INTEGER,
+            canonical_source_title TEXT,
             canonical_doi TEXT,
             cluster_confidence TEXT,
             cluster_method TEXT,
             member_count INTEGER,
             source_ref_ids TEXT
-        );
-
+        )
+        """,
+    )
+    ensure_table_exists(
+        conn,
+        "document_reference_links",
+        """
         CREATE TABLE document_reference_links (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            doc_id TEXT,
-            source_ref_id TEXT,
+            doc_id INTEGER,
+            source_ref_id INTEGER,
             cluster_id TEXT,
             link_method TEXT,
             link_confidence TEXT,
             FOREIGN KEY(cluster_id) REFERENCES reference_clusters(cluster_id)
-        );
-
+        )
+        """,
+    )
+    ensure_table_exists(
+        conn,
+        "reference_cluster_review",
+        """
         CREATE TABLE reference_cluster_review (
             review_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ref_id_1 TEXT,
-            ref_id_2 TEXT,
+            ref_id_1 INTEGER,
+            ref_id_2 INTEGER,
             cluster_id_1 TEXT,
             cluster_id_2 TEXT,
             first_author_norm TEXT,
@@ -252,18 +231,28 @@ def ensure_output_tables(conn: sqlite3.Connection) -> None:
             title_overlap REAL,
             suggested_action TEXT,
             reason TEXT
-        );
-
+        )
+        """,
+    )
+    ensure_table_exists(
+        conn,
+        "internal_citations",
+        """
         CREATE TABLE internal_citations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            citing_doc_id TEXT,
-            cited_doc_id TEXT,
+            citing_doc_id INTEGER,
+            cited_doc_id INTEGER,
             cluster_id TEXT,
             match_method TEXT,
             match_confidence TEXT
-        );
-        """
+        )
+        """,
     )
+
+    conn.execute("DELETE FROM reference_clusters")
+    conn.execute("DELETE FROM document_reference_links")
+    conn.execute("DELETE FROM reference_cluster_review")
+    conn.execute("DELETE FROM internal_citations")
     conn.commit()
 
 
@@ -275,6 +264,7 @@ def choose_canonical(records: list[RefRecord]) -> RefRecord:
             len(r.raw_first_author or ""),
             1 if r.year is not None else 0,
         )
+
     return sorted(records, key=score, reverse=True)[0]
 
 
@@ -287,10 +277,7 @@ def cluster_confidence_for_members(records: list[RefRecord]) -> tuple[str, str]:
     return "medium", "fuzzy_title"
 
 
-def detect_source_rows(
-    conn: sqlite3.Connection,
-    refs_table: str,
-) -> list[dict[str, Any]]:
+def detect_source_rows(conn: sqlite3.Connection, refs_table: str) -> list[dict[str, Any]]:
     cols = fetch_table_columns(conn, refs_table)
 
     ref_id_col = resolve_column(cols, ["cited_ref_id", "reference_id", "id"], refs_table)
@@ -412,18 +399,13 @@ def apply_tier3_fuzzy(
         for r in group:
             root = dsu.find(r.source_ref_id)
             current = rep_to_record.get(root)
-            if current is None:
-                rep_to_record[root] = r
-            else:
-                rep_to_record[root] = choose_canonical([current, r])
+            rep_to_record[root] = r if current is None else choose_canonical([current, r])
 
         reps = list(rep_to_record.items())
-        n = len(reps)
-        for i in range(n):
+        for i in range(len(reps)):
             root_i, rec_i = reps[i]
-            for j in range(i + 1, n):
+            for j in range(i + 1, len(reps)):
                 root_j, rec_j = reps[j]
-
                 if root_i == root_j:
                     continue
 
@@ -432,17 +414,15 @@ def apply_tier3_fuzzy(
                     continue
 
                 sim = fuzz.token_sort_ratio(rec_i.title_norm, rec_j.title_norm)
-
                 if sim >= auto_title_threshold:
-                    merged = dsu.union(root_i, root_j)
-                    if merged:
+                    if dsu.union(root_i, root_j):
                         methods.setdefault(rec_i.source_ref_id, "fuzzy_title")
                         methods.setdefault(rec_j.source_ref_id, "fuzzy_title")
                 elif review_title_min <= sim < auto_title_threshold:
                     review_rows.append(
                         (
-                            str(rec_i.source_ref_id),
-                            str(rec_j.source_ref_id),
+                            int(rec_i.source_ref_id),
+                            int(rec_j.source_ref_id),
                             None,
                             None,
                             author_key,
@@ -488,7 +468,6 @@ def materialize_clusters(
 
     for root, members in clusters.items():
         canonical = choose_canonical(members)
-
         seed = (
             canonical.doi_norm
             or canonical.exact_key
@@ -499,13 +478,13 @@ def materialize_clusters(
 
         conf, method = cluster_confidence_for_members(members)
         member_ids = sorted(str(m.source_ref_id) for m in members)
-
         cluster_rows.append(
             (
                 cluster_id,
                 canonical.raw_title or canonical.title_norm,
                 canonical.raw_first_author or canonical.first_author_norm,
                 canonical.year,
+                None,
                 canonical.doi_norm or None,
                 conf,
                 method,
@@ -520,8 +499,8 @@ def materialize_clusters(
             link_conf = "high" if link_method in {"doi_exact", "exact_key"} else conf
             link_rows.append(
                 (
-                    str(m.citing_doc_id),
-                    str(m.source_ref_id),
+                    int(m.citing_doc_id),
+                    int(m.source_ref_id),
                     cluster_id,
                     link_method,
                     link_conf,
@@ -532,8 +511,9 @@ def materialize_clusters(
         """
         INSERT INTO reference_clusters (
             cluster_id, canonical_title, canonical_first_author, canonical_year,
-            canonical_doi, cluster_confidence, cluster_method, member_count, source_ref_ids
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            canonical_source_title, canonical_doi, cluster_confidence, cluster_method,
+            member_count, source_ref_ids
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         cluster_rows,
     )
@@ -549,17 +529,12 @@ def materialize_clusters(
     return source_to_cluster
 
 
-def update_review_cluster_ids(
-    conn: sqlite3.Connection,
-    source_to_cluster: dict[Any, str],
-) -> None:
-    rows = conn.execute(
-        "SELECT review_id, ref_id_1, ref_id_2 FROM reference_cluster_review"
-    ).fetchall()
+def update_review_cluster_ids(conn: sqlite3.Connection, source_to_cluster: dict[Any, str]) -> None:
+    rows = conn.execute("SELECT review_id, ref_id_1, ref_id_2 FROM reference_cluster_review").fetchall()
     updates = []
     for review_id, ref1, ref2 in rows:
-        c1 = source_to_cluster.get(ref1) or source_to_cluster.get(int(ref1)) if str(ref1).isdigit() else source_to_cluster.get(ref1)
-        c2 = source_to_cluster.get(ref2) or source_to_cluster.get(int(ref2)) if str(ref2).isdigit() else source_to_cluster.get(ref2)
+        c1 = source_to_cluster.get(ref1)
+        c2 = source_to_cluster.get(ref2)
         updates.append((c1, c2, review_id))
 
     if updates:
@@ -592,10 +567,7 @@ def detect_document_rows(conn: sqlite3.Connection, docs_table: str) -> list[dict
         f"{quote_ident(title_col)} AS raw_title",
         f"{quote_ident(year_col)} AS raw_year",
     ]
-    if doi_col:
-        select_parts.append(f"{quote_ident(doi_col)} AS raw_doi")
-    else:
-        select_parts.append("NULL AS raw_doi")
+    select_parts.append(f"{quote_ident(doi_col)} AS raw_doi" if doi_col else "NULL AS raw_doi")
 
     sql = f"SELECT {', '.join(select_parts)} FROM {quote_ident(docs_table)}"
     cur = conn.execute(sql)
@@ -603,46 +575,38 @@ def detect_document_rows(conn: sqlite3.Connection, docs_table: str) -> list[dict
     return [dict(zip(names, row)) for row in cur.fetchall()]
 
 
-def build_internal_citations(
-    conn: sqlite3.Connection,
-    docs_table: str,
-    skip_internal_citations: bool,
-) -> None:
+def build_internal_citations(conn: sqlite3.Connection, docs_table: str, skip_internal_citations: bool) -> None:
     if skip_internal_citations:
         return
 
     cluster_rows = conn.execute(
         """
-        SELECT cluster_id, canonical_title, canonical_year, canonical_doi, cluster_confidence
+        SELECT cluster_id, canonical_title, canonical_year, canonical_doi
         FROM reference_clusters
         """
     ).fetchall()
 
     doc_rows = detect_document_rows(conn, docs_table)
-
-    docs = []
     doi_to_docs: dict[str, list[dict[str, Any]]] = defaultdict(list)
     year_title_docs: dict[int, list[dict[str, Any]]] = defaultdict(list)
 
     for row in doc_rows:
+        title_norm, title_tokens = normalize_title(row.get("raw_title"))
         doc = {
-            "doc_id": str(row["doc_id"]),
-            "title_raw": str(row.get("raw_title") or "").strip(),
-            "title_norm": normalize_title(row.get("raw_title"))[0],
-            "title_tokens": normalize_title(row.get("raw_title"))[1],
+            "doc_id": int(row["doc_id"]),
+            "title_norm": title_norm,
+            "title_tokens": title_tokens,
             "year": safe_year(row.get("raw_year")),
             "doi_norm": normalize_doi(row.get("raw_doi")),
         }
-        docs.append(doc)
         if doc["doi_norm"]:
             doi_to_docs[doc["doi_norm"]].append(doc)
         if doc["year"] is not None and doc["title_norm"]:
             year_title_docs[doc["year"]].append(doc)
 
     cluster_match_rows: list[tuple[Any, ...]] = []
-
-    for cluster_id, canonical_title, canonical_year, canonical_doi, cluster_confidence in cluster_rows:
-        matched_docs: list[tuple[str, str, str]] = []
+    for cluster_id, canonical_title, canonical_year, canonical_doi in cluster_rows:
+        matched_docs: list[tuple[int, str, str]] = []
 
         doi_norm = normalize_doi(canonical_doi)
         title_norm, title_tokens = normalize_title(canonical_title)
@@ -651,36 +615,32 @@ def build_internal_citations(
             for doc in doi_to_docs[doi_norm]:
                 matched_docs.append((doc["doc_id"], "doi", "high"))
         elif canonical_year is not None and title_norm:
-            candidates = year_title_docs.get(canonical_year, [])
             best_doc = None
-            best_sim = -1
-            for doc in candidates:
+            best_sim = -1.0
+            for doc in year_title_docs.get(canonical_year, []):
                 overlap = token_overlap(title_tokens, doc["title_tokens"])
                 if overlap < 0.5:
                     continue
-                sim = fuzz.token_sort_ratio(title_norm, doc["title_norm"])
+                sim = float(fuzz.token_sort_ratio(title_norm, doc["title_norm"]))
                 if sim > best_sim:
                     best_doc = doc
                     best_sim = sim
             if best_doc is not None and best_sim >= 92:
                 matched_docs.append((best_doc["doc_id"], "title_year", "medium"))
 
+        if not matched_docs:
+            continue
+
+        citing_rows = conn.execute(
+            "SELECT DISTINCT doc_id FROM document_reference_links WHERE cluster_id = ?",
+            (cluster_id,),
+        ).fetchall()
+
         for cited_doc_id, method, conf in matched_docs:
-            citing_rows = conn.execute(
-                """
-                SELECT DISTINCT doc_id
-                FROM document_reference_links
-                WHERE cluster_id = ?
-                """,
-                (cluster_id,),
-            ).fetchall()
             for (citing_doc_id,) in citing_rows:
-                citing_doc_id = str(citing_doc_id)
-                if citing_doc_id == cited_doc_id:
+                if int(citing_doc_id) == int(cited_doc_id):
                     continue
-                cluster_match_rows.append(
-                    (citing_doc_id, cited_doc_id, cluster_id, method, conf)
-                )
+                cluster_match_rows.append((int(citing_doc_id), int(cited_doc_id), cluster_id, method, conf))
 
     if cluster_match_rows:
         deduped = list(dict.fromkeys(cluster_match_rows))
@@ -696,69 +656,71 @@ def build_internal_citations(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Normalize cited references into deduplicated works.")
-    p.add_argument("--db", required=True, help="Path to SQLite database")
-    p.add_argument("--refs-table", default="cited_references", help="Parsed cited references table")
-    p.add_argument("--docs-table", default="documents", help="Corpus documents table")
-    p.add_argument("--auto-title-threshold", type=int, default=92, help="Auto-cluster threshold for fuzzy title similarity")
-    p.add_argument("--review-title-min", type=int, default=85, help="Lower threshold for manual review band")
-    p.add_argument("--title-overlap-min", type=float, default=0.50, help="Minimum title token overlap for fuzzy candidate comparison")
-    p.add_argument("--skip-internal-citations", action="store_true", help="Skip optional internal article-to-article citation linking")
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description="Normalize cited references into deduplicated works.")
+    parser.add_argument("--db", required=True, help="Path to SQLite database")
+    parser.add_argument("--refs-table", default="cited_references", help="Parsed cited references table")
+    parser.add_argument("--docs-table", default="documents", help="Corpus documents table")
+    parser.add_argument("--auto-title-threshold", type=int, default=DEFAULT_AUTO_TITLE_THRESHOLD)
+    parser.add_argument("--review-title-min", type=int, default=DEFAULT_REVIEW_TITLE_MIN)
+    parser.add_argument("--title-overlap-min", type=float, default=DEFAULT_TITLE_OVERLAP_MIN)
+    parser.add_argument("--skip-internal-citations", action="store_true")
+    return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.review_title_min > args.auto_title_threshold:
+        raise ValueError("review-title-min cannot be greater than auto-title-threshold")
 
     conn = sqlite3.connect(args.db)
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.row_factory = sqlite3.Row
 
-    ensure_output_tables(conn)
+    try:
+        ensure_output_tables(conn)
 
-    source_rows = detect_source_rows(conn, args.refs_table)
-    if not source_rows:
-        print(f"No rows found in {args.refs_table}", file=sys.stderr)
-        return 1
+        source_rows = detect_source_rows(conn, args.refs_table)
+        if not source_rows:
+            print(f"No rows found in {args.refs_table}", file=sys.stderr)
+            return 1
 
-    records = build_ref_records(source_rows)
-    dsu = DSU([r.source_ref_id for r in records])
+        records = build_ref_records(source_rows)
+        dsu = DSU([r.source_ref_id for r in records])
 
-    methods = apply_tier1_doi(records, dsu)
-    apply_tier2_exact_key(records, dsu, methods)
-    apply_tier3_fuzzy(
-        conn=conn,
-        records=records,
-        dsu=dsu,
-        methods=methods,
-        auto_title_threshold=args.auto_title_threshold,
-        review_title_min=args.review_title_min,
-        title_overlap_min=args.title_overlap_min,
-    )
+        methods = apply_tier1_doi(records, dsu)
+        apply_tier2_exact_key(records, dsu, methods)
+        apply_tier3_fuzzy(
+            conn=conn,
+            records=records,
+            dsu=dsu,
+            methods=methods,
+            auto_title_threshold=args.auto_title_threshold,
+            review_title_min=args.review_title_min,
+            title_overlap_min=args.title_overlap_min,
+        )
 
-    source_to_cluster = materialize_clusters(conn, records, dsu, methods)
-    update_review_cluster_ids(conn, source_to_cluster)
-    build_internal_citations(
-        conn=conn,
-        docs_table=args.docs_table,
-        skip_internal_citations=args.skip_internal_citations,
-    )
+        source_to_cluster = materialize_clusters(conn, records, dsu, methods)
+        update_review_cluster_ids(conn, source_to_cluster)
+        build_internal_citations(
+            conn=conn,
+            docs_table=args.docs_table,
+            skip_internal_citations=args.skip_internal_citations,
+        )
 
-    counts = {
-        "input_references": conn.execute(f"SELECT COUNT(*) FROM {quote_ident(args.refs_table)}").fetchone()[0],
-        "reference_clusters": conn.execute("SELECT COUNT(*) FROM reference_clusters").fetchone()[0],
-        "document_reference_links": conn.execute("SELECT COUNT(*) FROM document_reference_links").fetchone()[0],
-        "review_pairs": conn.execute("SELECT COUNT(*) FROM reference_cluster_review").fetchone()[0],
-        "internal_citations": conn.execute("SELECT COUNT(*) FROM internal_citations").fetchone()[0],
-    }
+        counts = {
+            "input_references": conn.execute(f"SELECT COUNT(*) FROM {quote_ident(args.refs_table)}").fetchone()[0],
+            "reference_clusters": conn.execute("SELECT COUNT(*) FROM reference_clusters").fetchone()[0],
+            "document_reference_links": conn.execute("SELECT COUNT(*) FROM document_reference_links").fetchone()[0],
+            "review_pairs": conn.execute("SELECT COUNT(*) FROM reference_cluster_review").fetchone()[0],
+            "internal_citations": conn.execute("SELECT COUNT(*) FROM internal_citations").fetchone()[0],
+        }
 
-    print("Normalization complete")
-    for k, v in counts.items():
-        print(f"{k}: {v}")
-
-    conn.close()
-    return 0
+        print("Normalization complete")
+        for key, value in counts.items():
+            print(f"{key}: {value}")
+        return 0
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

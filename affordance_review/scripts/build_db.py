@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import re
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Iterable
 from typing import Optional
 
 import pandas as pd
@@ -45,6 +45,8 @@ DOCUMENT_COLUMN_MAP = {
     "Source": "source_db",
 }
 
+REQUIRED_CSV_COLUMNS = ["EID", "Title", "Year"]
+
 
 def load_csv_robust(path: Path) -> tuple[pd.DataFrame, str]:
     encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
@@ -64,6 +66,13 @@ def normalize_blank_strings(df: pd.DataFrame) -> pd.DataFrame:
     for col in obj_cols:
         df[col] = df[col].replace(r"^\s*$", pd.NA, regex=True)
     return df
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build SQLite ingest tables from Scopus CSV.")
+    parser.add_argument("--csv", type=Path, default=CSV_PATH, help="Input Scopus CSV path")
+    parser.add_argument("--db", type=Path, default=DB_PATH, help="SQLite database path")
+    return parser.parse_args()
 
 def text_or_none(value) -> str | None:
     if pd.isna(value):
@@ -411,6 +420,21 @@ def assert_db_ready(conn: sqlite3.Connection) -> None:
         )
 
 
+def validate_input_df(df: pd.DataFrame) -> None:
+    missing = [col for col in REQUIRED_CSV_COLUMNS if col not in df.columns]
+    if missing:
+        raise RuntimeError(f"Input CSV is missing required columns: {missing}")
+
+    eid_norm = df["EID"].fillna("").astype(str).str.strip()
+    duplicate_eids = eid_norm[eid_norm.ne("") & eid_norm.duplicated(keep=False)]
+    if not duplicate_eids.empty:
+        sample = sorted(duplicate_eids.unique())[:5]
+        raise RuntimeError(
+            "Input CSV has non-unique EID values, refusing to ingest. "
+            f"Example duplicate EIDs: {sample}"
+        )
+
+
 def clear_ingest_tables(conn: sqlite3.Connection) -> None:
     """
     Rebuild ingest layer deterministically.
@@ -577,7 +601,7 @@ def ingest_authors(conn: sqlite3.Connection, df: pd.DataFrame, doc_map: dict[str
             author_id = author_cache[key]
             conn.execute(
                 """
-                INSERT INTO document_authors (doc_id, author_order, author_id)
+                INSERT OR IGNORE INTO document_authors (doc_id, author_order, author_id)
                 VALUES (?, ?, ?)
                 """,
                 (doc_id, idx + 1, author_id),
@@ -689,20 +713,20 @@ def ingest_references_raw(conn: sqlite3.Connection, df: pd.DataFrame, doc_map: d
 
 
 def main() -> int:
-    if not CSV_PATH.exists():
-        raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
-    if not DB_PATH.exists():
+    args = parse_args()
+
+    if not args.csv.exists():
+        raise FileNotFoundError(f"CSV not found: {args.csv}")
+    if not args.db.exists():
         raise FileNotFoundError(
-            f"SQLite DB not found: {DB_PATH}\nRun scripts/init_db.py first."
+            f"SQLite DB not found: {args.db}\nRun scripts/init_db.py first."
         )
 
-    df, encoding_used = load_csv_robust(CSV_PATH)
+    df, encoding_used = load_csv_robust(args.csv)
     df = normalize_blank_strings(df)
+    validate_input_df(df)
 
-    if "EID" not in df.columns:
-        raise RuntimeError("Input CSV is missing required column: EID")
-
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(args.db)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         assert_db_ready(conn)
@@ -728,7 +752,7 @@ def main() -> int:
         print(f"Documents with references: {ref_stats['docs_with_references']}")
         print(f"Raw references inserted: {ref_stats['references_raw_inserted']}")
         print(f"Suspicious short raw refs: {ref_stats['suspicious_short_refs']}")
-        print(f"Database populated: {DB_PATH}")
+        print(f"Database populated: {args.db}")
 
     finally:
         conn.close()
@@ -738,4 +762,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
