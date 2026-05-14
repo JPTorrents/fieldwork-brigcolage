@@ -1,0 +1,6 @@
+python-docx
+spacy
+textstat
+pandas
+pydantic>=2
+pytest
